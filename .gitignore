@@ -1,0 +1,6 @@
+.env
+.env.example
+/example.json
+processed
+raw
+output
