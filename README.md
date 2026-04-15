@@ -1,26 +1,26 @@
-# Speculative-Decoding-Parser
+# Speculative-Decoding-Parser 🔐
 
 A multilingual evaluation dataset generator for payment transaction analysis. This project processes conversation data with tool_calls from local processed files, HuggingFace datasets, or GCS buckets into an OpenAI-compatible or ShareGPT format.
 
-## Project Overview
+## Project Overview 📋
 
 This dataset is designed for training and evaluating AI models on payment transaction log analysis tasks. It contains conversations with:
 
-- System prompts defining the role of a payment transaction analysis agent
-- User queries about order investigations, payment failures, and transaction debugging
-- Assistant responses with tool_calls to various analysis tools
+- 📝 System prompts defining the role of a payment transaction analysis agent
+- ❓ User queries about order investigations, payment failures, and transaction debugging
+- 🤖 Assistant responses with tool_calls to various analysis tools
 
-### Data Sources
+### Data Sources 📦
 
 1. **Local processed files** (`processed/`): JSON files from SSH machine data containing payment transaction logs
 2. **HuggingFace** (`Salesforce/xlam-function-calling-60k`): Function calling dataset for additional training data
 3. **GCS Bucket**: Google Cloud Storage bucket for cloud-based data sources
 
-## Project Structure
+## Project Structure 📂
 
 ```
 juspay-eval-multilingual/
-├── output/            # Converted output files (JSONL)
+├── output/            # Converted output files (JSONL/JSON)
 │   └── dataset_YYYYMMDD_HHMMSS.jsonl
 ├── processed/        # Local JSON files with tool_calls (from SSH machine)
 ├── raw/              # Raw chat completion data
@@ -31,15 +31,10 @@ juspay-eval-multilingual/
 └── example.json      # Example data format
 ```
 
-## Installation
+## Installation 🛠️
 
 ```bash
 # Install dependencies
-pip install -r requirements.txt
-```
-
-All dependencies are installed automatically:
-```bash
 pip install -r requirements.txt
 ```
 
@@ -48,7 +43,7 @@ Note: On macOS, you can also install via brew:
 brew install gitleaks
 ```
 
-## Configuration
+## Configuration ⚙️
 
 1. Copy the example env file:
 ```bash
@@ -69,9 +64,9 @@ GCP_SERVICE_ACCOUNT_KEY=/path/to/service-account-key.json
 GCP_CREDENTIALS_B64=your_base64_encoded_credentials
 ```
 
-Get a HuggingFace token from: https://huggingface.co/settings/tokens
+🔑 Get a HuggingFace token from: https://huggingface.co/settings/tokens
 
-## Usage
+## Usage 🚀
 
 ### Basic Usage
 
@@ -140,7 +135,7 @@ python3 generate_data.py -n 10 -o ./output --hf --hf-dataset another/dataset
 | `--resume` | Resume from existing JSONL/JSON file | - |
 | `--output-format` | Output format: `jsonl` or `json` | `jsonl` |
 
-## Output Format
+## Output Format 📄
 
 ### OpenAI Format (default)
 
@@ -177,9 +172,9 @@ python3 generate_data.py -n 10 -o ./output --hf --hf-dataset another/dataset
 }
 ```
 
-Note: ShareGPT format converts tool_calls to text representation since ShareGPT doesn't natively support them.
+> ⚠️ Note: ShareGPT format converts tool_calls to text representation since ShareGPT doesn't natively support them.
 
-## System Resource Monitoring
+## System Resource Monitoring 💻
 
 The script displays system resources before generating the dataset:
 
@@ -205,7 +200,7 @@ Storage (current disk):
 Estimated output size: ~2 KB per sample
 ```
 
-## Sensitive Data Scanning
+## Sensitive Data Scanning 🔒
 
 The script includes a **sensitive data scanner** to detect API keys, tokens, passwords, and other secrets using gitleaks, trufflehog, or detect-secrets.
 
@@ -243,17 +238,17 @@ python3 generate_data.py scan-secrets --path . --output findings.json
 
 ### Detected Secret Types
 
-- **HIGH**: AWS keys, GCP keys, OpenAI API keys, HuggingFace tokens, GitHub/GitLab tokens, Stripe keys, passwords, database URLs with credentials, private keys, PayPal/Razorpay keys
-- **MEDIUM**: Generic API keys, Stripe test keys, environment variable references
+- 🔴 **HIGH**: AWS keys, GCP keys, OpenAI API keys, HuggingFace tokens, GitHub/GitLab tokens, Stripe keys, passwords, database URLs with credentials, private keys, PayPal/Razorpay keys
+- 🟡 **MEDIUM**: Generic API keys, Stripe test keys, environment variable references
 
-Secret scanning is **always enabled** during data generation. Use `--stop-on-secret` to halt processing when secrets are detected.
+> ✅ Secret scanning is **always enabled** during data generation. Use `--stop-on-secret` to halt processing when secrets are detected.
 
-## Dataset Statistics
+## Dataset Statistics 📊
 
-- Local processed files: ~96 samples with tool_calls
-- HuggingFace (xlam-function-calling-60k): 60,000 samples
-- Combined output: Validated samples with system+user+assistant+tool_calls
+- 📁 Local processed files: ~96 samples with tool_calls
+- 🤗 HuggingFace (xlam-function-calling-60k): 60,000 samples
+- ➕ Combined output: Validated samples with system+user+assistant+tool_calls
 
-## License
+## License 📜
 
 See LICENSE file for details.

@@ -3,3 +3,6 @@
 processed/*
 raw/*
 output/*
+__pycache__
+.claude
+
