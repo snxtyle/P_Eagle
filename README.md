@@ -1,6 +1,6 @@
 # Speculative-Decoding-Parser
 
-A multilingual evaluation dataset for payment transaction analysis. This project processes conversation data with tool_calls from local processed files and HuggingFace datasets into an OpenAI-compatible format.
+A multilingual evaluation dataset generator for payment transaction analysis. This project processes conversation data with tool_calls from local processed files, HuggingFace datasets, or GCS buckets into an OpenAI-compatible or ShareGPT format.
 
 ## Project Overview
 
@@ -14,19 +14,19 @@ This dataset is designed for training and evaluating AI models on payment transa
 
 1. **Local processed files** (`processed/`): JSON files from SSH machine data containing payment transaction logs
 2. **HuggingFace** (`Salesforce/xlam-function-calling-60k`): Function calling dataset for additional training data
+3. **GCS Bucket**: Google Cloud Storage bucket for cloud-based data sources
 
 ## Project Structure
 
 ```
 juspay-eval-multilingual/
 ├── output/            # Converted output files (JSONL)
-│   ├── openai_dataset.jsonl
-│   └── hf_output.jsonl
+│   └── dataset_YYYYMMDD_HHMMSS.jsonl
 ├── processed/        # Local JSON files with tool_calls (from SSH machine)
 ├── raw/              # Raw chat completion data
-├── openai_format.py  # Main converter script
+├── generate_data.py  # Main data generation script
 ├── requirements.txt  # Python dependencies
-├── .env              # HuggingFace token (sensitive)
+├── .env              # HuggingFace token and GCP credentials (sensitive)
 ├── .env.example      # Template for .env
 └── example.json      # Example data format
 ```
@@ -36,6 +36,16 @@ juspay-eval-multilingual/
 ```bash
 # Install dependencies
 pip install -r requirements.txt
+```
+
+All dependencies are installed automatically:
+```bash
+pip install -r requirements.txt
+```
+
+Note: On macOS, you can also install via brew:
+```bash
+brew install gitleaks
 ```
 
 ## Configuration
@@ -50,96 +60,199 @@ cp .env.example .env
 HF_TOKEN=your_huggingface_token_here
 ```
 
-Get a token from: https://huggingface.co/settings/tokens
+3. (Optional) Add GCP credentials for GCS bucket scanning:
+```
+GCP_PROJECT_ID=your_project_id
+# OR
+GCP_SERVICE_ACCOUNT_KEY=/path/to/service-account-key.json
+# OR
+GCP_CREDENTIALS_B64=your_base64_encoded_credentials
+```
+
+Get a HuggingFace token from: https://huggingface.co/settings/tokens
 
 ## Usage
 
-### Convert local files only
+### Basic Usage
+
 ```bash
-python3 openai_format.py --source local
+# Generate dataset from local files only (10 samples, OpenAI format)
+python3 generate_data.py -n 10 -o ./output -f openai --local
+
+# Generate dataset from local files (ShareGPT format)
+python3 generate_data.py -n 10 -o ./output -f sharegpt --local
+
+# Generate dataset from HuggingFace only
+python3 generate_data.py -n 10 -o ./output -f openai --hf
+
+# Generate dataset from GCS bucket
+python3 generate_data.py -n 10 -o ./output -f openai --gcs my-bucket
 ```
 
-### Convert HuggingFace dataset only
+### Multiple Sources with Ratio
+
 ```bash
-python3 openai_format.py --source hf --hf-limit 1000
+# Mix HuggingFace and local sources with ratio
+python3 generate_data.py -n 100 -o ./output -f openai --hf --local --ratio hf:0.6,local:0.4
 ```
 
-### Combine both sources
-```bash
-python3 openai_format.py --source both --hf-limit 50
-```
+### Additional Options
 
-### Additional options
 ```bash
-python3 openai_format.py --source both --hf-limit 100 --output custom_output.jsonl --min-words 30
+# With minimum word filter for assistant responses
+python3 generate_data.py -n 10 -o ./output -f openai --local --min-words 30
+
+# Stop processing if secrets are detected
+python3 generate_data.py -n 10 -o ./output -f openai --local --stop-on-secret
+
+# Remove duplicate samples
+python3 generate_data.py -n 10 -o ./output -f openai --local --deduplicate
+
+# Output as JSON instead of JSONL
+python3 generate_data.py -n 10 -o ./output -f openai --local --output-format json
+
+# Resume from existing output file
+python3 generate_data.py -n 10 -o ./output -f openai --local --resume ./output/existing.jsonl
+
+# Custom input directory
+python3 generate_data.py -n 10 -o ./output --local --input-dir ./my-data
+
+# Custom HuggingFace dataset
+python3 generate_data.py -n 10 -o ./output --hf --hf-dataset another/dataset
 ```
 
 #### CLI Arguments
-- `--source`: Data source - `local`, `hf`, or `both` (default: local)
-- `--input-dir`: Input directory for local JSON files (default: processed/)
-- `--output`: Output JSONL file (default: openai_dataset.jsonl)
-- `--hf-limit`: Limit number of samples from HuggingFace
-- `--min-words`: Minimum words in assistant response (0 = no filter)
+
+| Argument | Description | Default |
+|----------|-------------|---------|
+| `-o`, `--output` | Output directory | `./output` |
+| `-f`, `--format` | Output format: `openai` or `sharegpt` | `openai` |
+| `-n`, `--num-samples` | Total number of samples to generate | `1000` |
+| `--hf` | Use HuggingFace dataset as source | - |
+| `--local` | Use local files as source | - |
+| `--gcs` | Use GCS bucket as source | - |
+| `--ratio` | Ratio for mixing sources (e.g., `hf:0.6,local:0.4`) | - |
+| `--input-dir` | Input directory for local JSON files | `./processed` |
+| `--hf-dataset` | HuggingFace dataset name | `Salesforce/xlam-function-calling-60k` |
+| `--min-words` | Minimum words in assistant response (0=disabled) | `0` |
+| `--stop-on-secret` | Stop if secrets detected | `false` |
+| `--deduplicate` | Remove duplicate samples based on content hash | `false` |
+| `--resume` | Resume from existing JSONL/JSON file | - |
+| `--output-format` | Output format: `jsonl` or `json` | `jsonl` |
 
 ## Output Format
 
-The converter produces JSONL files in OpenAI format:
+### OpenAI Format (default)
 
 ```json
 {
   "messages": [
-    {"role": "system", "content": "..."},
-    {"role": "user", "content": "..."},
-    {"role": "assistant", "content": null, "tool_calls": [...]}
+    {"role": "system", "content": "You are a helpful assistant."},
+    {"role": "user", "content": "What is the status of order 12345?"},
+    {"role": "assistant", "content": null, "tool_calls": [
+      {
+        "id": "call_123",
+        "type": "function",
+        "function": {
+          "name": "get_order_status",
+          "arguments": "{\"order_id\": \"12345\"}"
+        }
+      }
+    ]},
+    {"role": "tool", "content": "Order status: CONFIRMED", "tool_call_id": "call_123"},
+    {"role": "assistant", "content": "The order 12345 is CONFIRMED."}
   ]
 }
 ```
+
+### ShareGPT Format
+
+```json
+{
+  "conversations": [
+    {"from": "human", "value": "You are a helpful assistant."},
+    {"from": "human", "value": "What is the status of order 12345?"},
+    {"from": "gpt", "value": "\n[Tool Calls]:\n- get_order_status({\"order_id\": \"12345\"})\n\nOrder status: CONFIRMED"}
+  ]
+}
+```
+
+Note: ShareGPT format converts tool_calls to text representation since ShareGPT doesn't natively support them.
+
+## System Resource Monitoring
+
+The script displays system resources before generating the dataset:
+
+```
+============================================================
+SYSTEM RESOURCES
+============================================================
+
+CPU:
+  Cores: 14 logical, 14 physical
+  Usage: 18.2%
+
+Memory:
+  Total: 24.0 GB
+  Available: 5.25 GB
+  Usage: 78.1%
+
+Storage (current disk):
+  Total: 460.43 GB
+  Free: 130.0 GB
+  Usage: 71.8%
+
+Estimated output size: ~2 KB per sample
+```
+
+## Sensitive Data Scanning
+
+The script includes a **sensitive data scanner** to detect API keys, tokens, passwords, and other secrets using gitleaks, trufflehog, or detect-secrets.
+
+### Scan local directory
+
+```bash
+python3 generate_data.py scan-secrets --path .
+```
+
+### Scan specific directory
+
+```bash
+python3 generate_data.py scan-secrets --path ./processed
+```
+
+### Scan GCS bucket
+
+```bash
+python3 generate_data.py scan-secrets --path my-bucket-name
+```
+
+### Save findings to JSON
+
+```bash
+python3 generate_data.py scan-secrets --path . --output findings.json
+```
+
+#### Scan-secrets CLI Arguments
+
+| Argument | Description | Default |
+|----------|-------------|---------|
+| `--path` | Path to scan (directory or GCS bucket name) | `.` |
+| `--extensions` | File extensions to scan | `.json, .yaml, .yml, .env, .txt, .py, .js, .ts, .sh, .tf, .cfg, .ini, .properties` |
+| `--output` | Save findings to JSON file | - |
+
+### Detected Secret Types
+
+- **HIGH**: AWS keys, GCP keys, OpenAI API keys, HuggingFace tokens, GitHub/GitLab tokens, Stripe keys, passwords, database URLs with credentials, private keys, PayPal/Razorpay keys
+- **MEDIUM**: Generic API keys, Stripe test keys, environment variable references
+
+Secret scanning is **always enabled** during data generation. Use `--stop-on-secret` to halt processing when secrets are detected.
 
 ## Dataset Statistics
 
 - Local processed files: ~96 samples with tool_calls
 - HuggingFace (xlam-function-calling-60k): 60,000 samples
 - Combined output: Validated samples with system+user+assistant+tool_calls
-
-## Usage - Sensitive Data Scanning
-
-The script also includes a **sensitive data scanner** to detect API keys, tokens, passwords, and other secrets in local files or GCS buckets.
-
-### Scan local directory
-```bash
-python3 openai_format.py scan-secrets --path .
-```
-
-### Scan specific directory
-```bash
-python3 openai_format.py scan-secrets --path ./processed
-```
-
-### Scan GCS bucket
-```bash
-python3 openai_format.py scan-secrets --path my-bucket-name --gcs
-```
-
-### Scan GCS bucket with prefix
-```bash
-python3 openai_format.py scan-secrets --path my-bucket-name --gcs --prefix logs/
-```
-
-### Save findings to JSON
-```bash
-python3 openai_format.py scan-secrets --path . --output findings.json
-```
-
-#### Scan-secrets CLI Arguments
-- `--path`: Path to scan (directory or GCS bucket name)
-- `--gcs`: Treat path as GCS bucket name
-- `--prefix`: GCS prefix to scan
-- `--extensions`: File extensions to scan (default: .json, .yaml, .yml, .env, .txt, .py, .js, .ts, .sh, .tf, .cfg, .ini, .properties)
-- `--output`: Save findings to JSON file
-
-### Detected Secret Types
-- **HIGH**: AWS keys, GCP keys, OpenAI API keys, HuggingFace tokens, GitHub/GitLab tokens, Stripe keys, passwords, database URLs with credentials, private keys, PayPal/Razorpay keys
-- **MEDIUM**: Generic API keys, Stripe test keys, environment variable references
 
 ## License
 

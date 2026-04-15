@@ -4,9 +4,20 @@ import re
 import random
 import argparse
 import subprocess
+import shutil
+import hashlib
+from datetime import datetime
 from glob import glob
 from typing import Optional, List, Dict, Any, Tuple
 from dataclasses import dataclass
+
+# Try to import psutil for system monitoring
+try:
+    import psutil
+    PSUTIL_AVAILABLE = True
+except ImportError:
+    PSUTIL_AVAILABLE = False
+    print("Note: psutil not installed. Run: pip install psutil for detailed system metrics")
 
 # Default paths
 DEFAULT_INPUT_DIR = "/Users/suraj.nagre/Desktop/juspay-eval-multilingual/processed"
@@ -14,6 +25,98 @@ DEFAULT_OUTPUT_FILE = "/Users/suraj.nagre/Desktop/juspay-eval-multilingual/outpu
 
 # HuggingFace dataset config
 HF_DATASET_NAME = "Salesforce/xlam-function-calling-60k"
+
+
+def check_system_resources() -> Dict[str, Any]:
+    """Check and return system resource information."""
+    resources = {
+        "cpu": {},
+        "memory": {},
+        "storage": {}
+    }
+
+    # CPU Information
+    if PSUTIL_AVAILABLE:
+        resources["cpu"]["count"] = psutil.cpu_count(logical=True)
+        resources["cpu"]["physical"] = psutil.cpu_count(logical=False)
+        resources["cpu"]["usage_percent"] = psutil.cpu_percent(interval=1)
+        # Per-CPU usage
+        resources["cpu"]["per_cpu"] = psutil.cpu_percent(interval=1, percpu=True)
+    else:
+        # Fallback: use subprocess
+        try:
+            result = subprocess.run(["sysctl", "-n", "hw.ncpu"], capture_output=True, text=True)
+            resources["cpu"]["count"] = int(result.stdout.strip()) if result.returncode == 0 else "N/A"
+        except:
+            resources["cpu"]["count"] = "N/A"
+
+    # Memory Information
+    if PSUTIL_AVAILABLE:
+        mem = psutil.virtual_memory()
+        resources["memory"]["total_gb"] = round(mem.total / (1024**3), 2)
+        resources["memory"]["available_gb"] = round(mem.available / (1024**3), 2)
+        resources["memory"]["used_gb"] = round(mem.used / (1024**3), 2)
+        resources["memory"]["usage_percent"] = mem.percent
+    else:
+        resources["memory"]["total_gb"] = "N/A"
+        resources["memory"]["available_gb"] = "N/A"
+        resources["memory"]["usage_percent"] = "N/A"
+
+    # Storage Information for current directory
+    try:
+        # Get disk usage for current path
+        usage = shutil.disk_usage(".")
+        resources["storage"]["total_gb"] = round(usage.total / (1024**3), 2)
+        resources["storage"]["used_gb"] = round(usage.used / (1024**3), 2)
+        resources["storage"]["free_gb"] = round(usage.free / (1024**3), 2)
+        resources["storage"]["usage_percent"] = round((usage.used / usage.total) * 100, 1)
+    except Exception as e:
+        resources["storage"]["error"] = str(e)
+
+    # Estimate storage needed for output (rough estimate: ~2KB per sample)
+    resources["estimate_per_sample_kb"] = 2
+
+    return resources
+
+
+def print_system_resources(resources: Dict[str, Any]):
+    """Print system resources in a formatted way."""
+    print(f"\n{'='*60}")
+    print(f"SYSTEM RESOURCES")
+    print(f"{'='*60}")
+
+    # CPU
+    cpu = resources.get("cpu", {})
+    print(f"\nCPU:")
+    if PSUTIL_AVAILABLE:
+        print(f"  Cores: {cpu.get('count', 'N/A')} logical, {cpu.get('physical', 'N/A')} physical")
+        print(f"  Usage: {cpu.get('usage_percent', 'N/A')}%")
+    else:
+        print(f"  Cores: {cpu.get('count', 'N/A')}")
+        print(f"  Usage: Install psutil for detailed CPU metrics")
+
+    # Memory
+    mem = resources.get("memory", {})
+    print(f"\nMemory:")
+    if PSUTIL_AVAILABLE:
+        print(f"  Total: {mem.get('total_gb', 'N/A')} GB")
+        print(f"  Available: {mem.get('available_gb', 'N/A')} GB")
+        print(f"  Usage: {mem.get('usage_percent', 'N/A')}%")
+    else:
+        print(f"  Install psutil for memory details")
+
+    # Storage
+    storage = resources.get("storage", {})
+    print(f"\nStorage (current disk):")
+    if "error" not in storage:
+        print(f"  Total: {storage.get('total_gb', 'N/A')} GB")
+        print(f"  Free: {storage.get('free_gb', 'N/A')} GB")
+        print(f"  Usage: {storage.get('usage_percent', 'N/A')}%")
+    else:
+        print(f"  Error: {storage.get('error', 'N/A')}")
+
+    est_per_sample = resources.get("estimate_per_sample_kb", 2)
+    print(f"\nEstimated output size: ~{est_per_sample} KB per sample")
 
 # Try to import datasets, handle gracefully if not installed
 try:
@@ -126,6 +229,188 @@ def has_tool_calls(messages: List[Dict[str, Any]]) -> bool:
         if msg.get("role") == "assistant" and msg.get("tool_calls"):
             return True
     return False
+
+
+def convert_to_sharegpt(sample: Dict[str, Any]) -> Dict[str, Any]:
+    """Convert OpenAI format to ShareGPT format.
+
+    OpenAI format: {"messages": [{"role": "user/assistant/system", "content": "...", "tool_calls": [...]}]}
+    ShareGPT format: {"conversations": [{"from": "human/gpt", "value": "..."}]}
+
+    Note: ShareGPT doesn't natively support tool_calls, so we convert them to a string representation.
+    """
+    messages = sample.get("messages", [])
+    if not messages:
+        return None
+
+    conversations = []
+
+    for msg in messages:
+        role = msg.get("role")
+        content = msg.get("content")
+        tool_calls = msg.get("tool_calls")
+
+        # Map roles to ShareGPT format
+        if role == "system":
+            # ShareGPT uses human for system messages too
+            from_value = "human"
+            value = content or ""
+        elif role == "user":
+            from_value = "human"
+            value = content or ""
+        elif role == "assistant":
+            from_value = "gpt"
+            value = content or ""
+
+            # Convert tool_calls to text representation
+            if tool_calls:
+                tool_calls_str = "\n[Tool Calls]:\n"
+                for tc in tool_calls:
+                    func = tc.get("function", {})
+                    name = func.get("name", "unknown")
+                    args = func.get("arguments", "")
+                    if isinstance(args, dict):
+                        args = json.dumps(args)
+                    tool_calls_str += f"- {name}({args})\n"
+                value = (value or "") + tool_calls_str
+        elif role == "tool":
+            from_value = "human"  # Tool responses treated as human input context
+            value = content or ""
+        else:
+            continue
+
+        if value:  # Only add non-empty messages
+            conversations.append({
+                "from": from_value,
+                "value": value
+            })
+
+    if not conversations:
+        return None
+
+    return {"conversations": conversations}
+
+
+def convert_to_openai(sample: Dict[str, Any]) -> Dict[str, Any]:
+    """Convert ShareGPT format to OpenAI format.
+
+    ShareGPT format: {"conversations": [{"from": "human/gpt", "value": "..."}]}
+    OpenAI format: {"messages": [{"role": "user/assistant/system", "content": "..."}]}
+    """
+    conversations = sample.get("conversations", [])
+    if not conversations:
+        return None
+
+    messages = []
+
+    for conv in conversations:
+        from_val = conv.get("from", "")
+        value = conv.get("value", "")
+
+        # Map ShareGPT roles to OpenAI roles
+        if from_val == "human":
+            role = "user"
+        elif from_val == "gpt":
+            role = "assistant"
+        else:
+            continue
+
+        if value:
+            messages.append({
+                "role": role,
+                "content": value
+            })
+
+    if not messages:
+        return None
+
+    return {"messages": messages}
+
+
+def compute_sample_hash(sample: Dict[str, Any]) -> str:
+    """Compute a hash for a sample for deduplication."""
+    # Create a normalized representation of the conversation
+    messages = sample.get("messages", [])
+    content_parts = []
+
+    for msg in messages:
+        role = msg.get("role", "")
+        content = msg.get("content", "") or ""
+        tool_calls = msg.get("tool_calls", [])
+
+        # Include role and content
+        content_parts.append(f"{role}:{content}")
+
+        # Include tool call names and their arguments
+        if tool_calls:
+            for tc in tool_calls:
+                func = tc.get("function", {})
+                name = func.get("name", "")
+                args = func.get("arguments", "")
+                content_parts.append(f"tool:{name}:{args}")
+
+    # Create hash
+    content_str = "|".join(content_parts)
+    return hashlib.sha256(content_str.encode('utf-8')).hexdigest()
+
+
+def deduplicate_samples(samples: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], Dict[str, int]]:
+    """Remove duplicate samples based on content hash.
+
+    Returns:
+        Tuple of (deduplicated samples, stats dict)
+    """
+    seen_hashes = set()
+    unique_samples = []
+    stats = {
+        "total": len(samples),
+        "duplicates": 0,
+        "unique": 0
+    }
+
+    for sample in samples:
+        sample_hash = compute_sample_hash(sample)
+
+        if sample_hash not in seen_hashes:
+            seen_hashes.add(sample_hash)
+            unique_samples.append(sample)
+            stats["unique"] += 1
+        else:
+            stats["duplicates"] += 1
+
+    return unique_samples, stats
+
+
+def load_from_existing_output(file_path: str) -> List[Dict[str, Any]]:
+    """Load samples from existing output file for resume capability.
+
+    Supports both JSON and JSONL formats.
+    """
+    samples = []
+
+    try:
+        with open(file_path, 'r', encoding='utf-8') as f:
+            if file_path.endswith('.json'):
+                # JSON array format
+                data = json.load(f)
+                if isinstance(data, list):
+                    samples = data
+            else:
+                # JSONL format
+                for line in f:
+                    line = line.strip()
+                    if line:
+                        try:
+                            samples.append(json.loads(line))
+                        except json.JSONDecodeError:
+                            continue
+    except FileNotFoundError:
+        print(f"Warning: Resume file not found: {file_path}")
+    except Exception as e:
+        print(f"Error loading resume file: {e}")
+
+    print(f"Loaded {len(samples)} samples from existing output for resume")
+    return samples
 
 
 def load_from_huggingface(limit: Optional[int] = None) -> List[Dict[str, Any]]:
@@ -442,10 +727,61 @@ def find_detect_secrets_cmd() -> Optional[str]:
     return "detect-secrets"  # fallback
 
 
+def install_gitleaks() -> bool:
+    """Install gitleaks binary automatically."""
+    import platform
+    import urllib.request
+    import zipfile
+    import io
+
+    system = platform.system()
+    machine = platform.machine()
+
+    # Determine the correct binary URL
+    if system == "Darwin":
+        if machine == "arm64":
+            url = "https://github.com/zricethezav/gitleaks/releases/download/v8.18.3/gitleaks_8.18.3_darwin_arm64.zip"
+        else:
+            url = "https://github.com/zricethezav/gitleaks/releases/download/v8.18.3/gitleaks_8.18.3_darwin_x64.zip"
+    elif system == "Linux":
+        if machine == "x86_64":
+            url = "https://github.com/zricethezav/gitleaks/releases/download/v8.18.3/gitleaks_8.18.3_linux_x64.tar.gz"
+        else:
+            return False
+    else:
+        return False
+
+    try:
+        print("Installing gitleaks...")
+        # Download the archive
+        response = urllib.request.urlopen(url, timeout=60)
+        data = io.BytesIO(response.read())
+
+        # Extract to home bin directory
+        import os
+        bin_dir = os.path.expanduser("~/Library/Python/3.9/bin")
+        os.makedirs(bin_dir, exist_ok=True)
+
+        if url.endswith(".zip"):
+            with zipfile.ZipFile(data) as zf:
+                zf.extractall(bin_dir)
+        else:
+            import tarfile
+            with tarfile.open(fileobj=data) as tf:
+                tf.extractall(bin_dir)
+
+        print(f"✓ gitleaks installed to {bin_dir}")
+        return True
+    except Exception as e:
+        print(f"Failed to install gitleaks: {e}")
+        return False
+
+
 def find_gitleaks_cmd() -> Optional[str]:
-    """Find the gitleaks executable path."""
+    """Find the gitleaks executable path. Auto-installs if not found."""
     gitleaks_paths = [
         "gitleaks",
+        os.path.expanduser("~/Library/Python/3.9/bin/gitleaks"),
         "/usr/local/bin/gitleaks",
         "/usr/bin/gitleaks",
         "/opt/homebrew/bin/gitleaks",
@@ -456,11 +792,24 @@ def find_gitleaks_cmd() -> Optional[str]:
         if result.returncode == 0:
             return path
 
+    # Try to auto-install
+    if install_gitleaks():
+        return os.path.expanduser("~/Library/Python/3.9/bin/gitleaks")
+
     return None
 
 
 def find_trufflehog_cmd() -> Optional[str]:
     """Find the trufflehog executable path."""
+    # Check if Python trufflehog package is available
+    try:
+        import trufflehog
+        # Return the module path so we can call it
+        return "trufflehog"
+    except ImportError:
+        pass
+
+    # Check for CLI binary
     trufflehog_paths = [
         "trufflehog",
         "/usr/local/bin/trufflehog",
@@ -538,12 +887,29 @@ def scan_file_for_secrets(file_path: str) -> List[SecretFinding]:
 
         if trufflehog_cmd:
             try:
-                result = subprocess.run(
-                    [trufflehog_cmd, "filesystem", file_path, "--json"],
-                    capture_output=True,
-                    text=True,
-                    timeout=60
-                )
+                # Check if it's the Python module or CLI binary
+                if trufflehog_cmd == "trufflehog" and not shutil.which("trufflehog"):
+                    # Use Python module
+                    try:
+                        import trufflehog
+                        # Run as Python module
+                        result = subprocess.run(
+                            ["python3", "-m", "trufflehog", "filesystem", file_path, "--json"],
+                            capture_output=True,
+                            text=True,
+                            timeout=60
+                        )
+                    except ImportError:
+                        result = subprocess.CompletedPipe()
+                        result.returncode = 1
+                else:
+                    # Use CLI binary
+                    result = subprocess.run(
+                        [trufflehog_cmd, "filesystem", file_path, "--json"],
+                        capture_output=True,
+                        text=True,
+                        timeout=60
+                    )
 
                 if result.stdout.strip():
                     for line in result.stdout.strip().split('\n'):
@@ -874,6 +1240,25 @@ def main():
         action="store_true",
         help="Stop if secrets found (default: continue and report)"
     )
+    parser.add_argument(
+        "--resume",
+        type=str,
+        default=None,
+        help="Resume from existing output file (specify path to JSONL/JSON file)"
+    )
+    parser.add_argument(
+        "--deduplicate",
+        action="store_true",
+        default=False,
+        help="Remove duplicate samples based on content hash"
+    )
+    parser.add_argument(
+        "--output-format",
+        type=str,
+        choices=["jsonl", "json"],
+        default="jsonl",
+        help="Output file format: jsonl or json (default: jsonl)"
+    )
 
     # Secret scanning always enabled
     scan_secrets = True
@@ -906,6 +1291,17 @@ def main():
     )
     
     args = parser.parse_args()
+
+    # Check and display system resources
+    resources = check_system_resources()
+    print_system_resources(resources)
+
+    # Estimate required storage
+    estimated_storage_mb = (args.num_samples * resources.get("estimate_per_sample_kb", 2)) / 1024
+    free_storage_gb = resources.get("storage", {}).get("free_gb", 0)
+
+    if estimated_storage_mb > free_storage_gb * 1024:
+        print(f"\n⚠️  Warning: Estimated output ({estimated_storage_mb:.1f} MB) exceeds free storage ({free_storage_gb:.1f} GB)")
 
     # Handle scan-secrets command
     if args.command == "scan-secrets":
@@ -1011,11 +1407,14 @@ def main():
     if len(sources) > 1:
         print(f"Ratio: {args.ratio}")
     print(f"Format: {args.format}")
-    print(f"Output: {args.output}/dataset.jsonl")
 
     # Create output directory
     os.makedirs(args.output, exist_ok=True)
-    output_file = os.path.join(args.output, "dataset.jsonl")
+
+    # Generate unique filename with timestamp
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    output_file = os.path.join(args.output, f"dataset_{timestamp}.jsonl")
+    print(f"Output: {output_file}")
 
     # Load samples from each source
     all_samples = {"hf": [], "local": [], "gcs": []}
@@ -1071,16 +1470,139 @@ def main():
             print(f"  Warning: Only {len(source_samples)} available for {source}, using all")
             final_samples.extend(source_samples)
 
+    # Deduplicate samples if requested
+    if args.deduplicate:
+        print(f"\nDeduplicating {len(final_samples)} samples...")
+        final_samples, dedup_stats = deduplicate_samples(final_samples)
+        print(f"  Removed {dedup_stats['duplicates']} duplicates")
+        print(f"  Unique samples: {dedup_stats['unique']}")
+
+    # Handle resume capability
+    existing_samples = []
+    if args.resume:
+        print(f"\nResuming from: {args.resume}")
+        existing_samples = load_from_existing_output(args.resume)
+        if existing_samples:
+            # Get hashes of existing samples
+            existing_hashes = set()
+            for sample in existing_samples:
+                h = compute_sample_hash(sample)
+                existing_hashes.add(h)
+
+            # Filter out duplicates with existing samples
+            new_samples = []
+            resume_duplicates = 0
+            for sample in final_samples:
+                h = compute_sample_hash(sample)
+                if h not in existing_hashes:
+                    new_samples.append(sample)
+                else:
+                    resume_duplicates += 1
+
+            print(f"  Skipping {resume_duplicates} samples already in resume file")
+            final_samples = existing_samples + new_samples
+            print(f"  Total samples after resume: {len(final_samples)}")
+
     # Limit to num_samples
     final_samples = final_samples[:args.num_samples]
 
     print(f"\nTotal samples to write: {len(final_samples)}")
 
-    # Write to output file
+    # Write to output file (JSON or JSONL)
     count_valid = 0
     secret_findings = []
     temp_file = "/tmp/secret_scan_temp"
 
+    if args.output_format == "json":
+        # JSON format - collect all samples first
+        output_data = []
+
+        with open(output_file.replace('.jsonl', '.json'), "w") as out_f:
+            for idx, sample in enumerate(final_samples):
+                # Apply minimum word filter if specified
+                if args.min_words > 0:
+                    assistant_content = None
+                    for msg in sample.get("messages", []):
+                        if msg.get("role") == "assistant" and msg.get("content"):
+                            assistant_content = msg.get("content", "")
+                            break
+
+                    if assistant_content and len(assistant_content.split()) < args.min_words:
+                        stats["too_short"] += 1
+                        continue
+
+                # Real-time secret scanning (always scan the original sample)
+                if scan_secrets:
+                    # Write sample to temp file for scanning
+                    with open(temp_file, "w") as tf:
+                        sample_str = json.dumps(sample, ensure_ascii=False)
+                        tf.write(sample_str)
+
+                    # Scan the temp file
+                    findings = scan_file_for_secrets(temp_file)
+
+                    if findings:
+                        for f in findings:
+                            f.file_path = f"sample_{idx}"
+                            secret_findings.append(f)
+
+                        if args.stop_on_secret:
+                            print(f"\n⚠️  SECRETS FOUND in sample {idx}!")
+                            for f in findings[:3]:
+                                print(f"  - {f.secret_type} (line {f.line_number})")
+                            print("\nStopping due to --stop-on-secret flag")
+                            break
+
+                # Apply format conversion if needed
+                if args.format == "sharegpt":
+                    output_sample = convert_to_sharegpt(sample)
+                else:
+                    output_sample = sample
+
+                if output_sample:
+                    output_data.append(output_sample)
+                    count_valid += 1
+
+                # Progress indicator for large datasets
+                if (idx + 1) % 1000 == 0:
+                    print(f"  Processed {idx + 1}/{len(final_samples)} samples...")
+
+            # Write all data as JSON array
+            json.dump(output_data, out_f, ensure_ascii=False, indent=2)
+            output_file = output_file.replace('.jsonl', '.json')
+
+        # Clean up temp file
+        if os.path.exists(temp_file):
+            os.remove(temp_file)
+
+        print("\n===== SUMMARY =====")
+        print(f"Total samples: {len(final_samples)}")
+        print(f"Valid samples: {count_valid}")
+
+        print("\nDrop reasons:")
+        for k, v in stats.items():
+            if v > 0:
+                print(f"  {k}: {v}")
+
+        # Secret scanning summary
+        if scan_secrets:
+            print("\n===== SECRET SCAN SUMMARY =====")
+            if secret_findings:
+                high_secrets = [f for f in secret_findings if f.severity == "HIGH"]
+                medium_secrets = [f for f in secret_findings if f.severity == "MEDIUM"]
+                print(f"Secrets found: {len(secret_findings)}")
+                print(f"  - HIGH severity: {len(high_secrets)}")
+                print(f"  - MEDIUM severity: {len(medium_secrets)}")
+
+                if args.stop_on_secret:
+                    print("\n⚠️  Processing stopped early due to secret detection!")
+            else:
+                print("✓ No secrets detected in any samples!")
+
+        print(f"\nOutput written to: {output_file}")
+        return
+
+    # JSONL format (default)
     with open(output_file, "w") as out_f:
         for idx, sample in enumerate(final_samples):
             # Apply minimum word filter if specified
@@ -1095,7 +1617,7 @@ def main():
                     stats["too_short"] += 1
                     continue
 
-            # Real-time secret scanning
+            # Real-time secret scanning (always scan the original sample)
             if scan_secrets:
                 # Write sample to temp file for scanning
                 with open(temp_file, "w") as tf:
@@ -1117,8 +1639,15 @@ def main():
                         print("\nStopping due to --stop-on-secret flag")
                         break
 
-            out_f.write(json.dumps(sample, ensure_ascii=False) + "\n")
-            count_valid += 1
+            # Apply format conversion if needed
+            if args.format == "sharegpt":
+                output_sample = convert_to_sharegpt(sample)
+            else:
+                output_sample = sample
+
+            if output_sample:
+                out_f.write(json.dumps(output_sample, ensure_ascii=False) + "\n")
+                count_valid += 1
 
             # Progress indicator for large datasets
             if (idx + 1) % 1000 == 0:

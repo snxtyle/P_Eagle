@@ -2,5 +2,12 @@
 datasets>=2.0.0
 python-dotenv>=1.0.0
 
+# System monitoring
+psutil>=5.9.0
+
 # Secret detection
 detect-secrets>=1.4.0
+trufflehog>=2.2.0
+
+# GCS bucket access
+google-cloud-storage>=2.0.0
