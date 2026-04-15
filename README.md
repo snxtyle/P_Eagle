@@ -101,6 +101,46 @@ The converter produces JSONL files in OpenAI format:
 - HuggingFace (xlam-function-calling-60k): 60,000 samples
 - Combined output: Validated samples with system+user+assistant+tool_calls
 
+## Usage - Sensitive Data Scanning
+
+The script also includes a **sensitive data scanner** to detect API keys, tokens, passwords, and other secrets in local files or GCS buckets.
+
+### Scan local directory
+```bash
+python3 openai_format.py scan-secrets --path .
+```
+
+### Scan specific directory
+```bash
+python3 openai_format.py scan-secrets --path ./processed
+```
+
+### Scan GCS bucket
+```bash
+python3 openai_format.py scan-secrets --path my-bucket-name --gcs
+```
+
+### Scan GCS bucket with prefix
+```bash
+python3 openai_format.py scan-secrets --path my-bucket-name --gcs --prefix logs/
+```
+
+### Save findings to JSON
+```bash
+python3 openai_format.py scan-secrets --path . --output findings.json
+```
+
+#### Scan-secrets CLI Arguments
+- `--path`: Path to scan (directory or GCS bucket name)
+- `--gcs`: Treat path as GCS bucket name
+- `--prefix`: GCS prefix to scan
+- `--extensions`: File extensions to scan (default: .json, .yaml, .yml, .env, .txt, .py, .js, .ts, .sh, .tf, .cfg, .ini, .properties)
+- `--output`: Save findings to JSON file
+
+### Detected Secret Types
+- **HIGH**: AWS keys, GCP keys, OpenAI API keys, HuggingFace tokens, GitHub/GitLab tokens, Stripe keys, passwords, database URLs with credentials, private keys, PayPal/Razorpay keys
+- **MEDIUM**: Generic API keys, Stripe test keys, environment variable references
+
 ## License
 
 See LICENSE file for details.

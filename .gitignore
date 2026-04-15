@@ -1,6 +1,5 @@
 .env
-.env.example
 /example.json
-processed
-raw
-output
+processed/*
+raw/*
+output/*
