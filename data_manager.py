@@ -1522,49 +1522,82 @@ class EAGLEDistiller:
 
         return True
 
+    def _generate_loss_mask_segments(self, messages: List[Dict[str, Any]]) -> Dict[str, Any]:
+        """
+        EAGLE Preparation: Generate SEGMENT-BASED loss mask specification.
+
+        CRITICAL: EAGLE-3 trains on TOKENS, not characters. This method outputs
+        MASK SEGMENTS that specify which MESSAGE ROLES to train on. The Feature
+        Extraction script will convert these to token-level masks using the ACTUAL
+        GLM 5.1 tokenizer on the H200 cluster.
+
+        Returns:
+            Dict with train_indices, ignore_indices, and per-message specifications
+        """
+        train_indices = []
+        ignore_indices = []
+        segments = []
+
+        for idx, msg in enumerate(messages):
+            role = msg.get("role", "")
+
+            # Determine mask: 1 = predict (train), 0 = ignore
+            if role == "assistant":
+                mask = 1
+                train_indices.append(idx)
+            else:
+                # system, user, tool - don't predict
+                mask = 0
+                ignore_indices.append(idx)
+
+            segments.append({
+                "index": idx,
+                "role": role,
+                "mask": mask
+            })
+
+        return {
+            "train_indices": train_indices,
+            "ignore_indices": ignore_indices,
+            "segments": segments
+        }
+
+    def _inject_jar_persona(self, messages: List[Dict[str, Any]], source: str) -> List[Dict[str, Any]]:
+        """
+        Source-Aware Persona Management:
+        - Local: Keep original high-fidelity prompts (JAR, Config Agent, etc.)
+        - HF: Remove generic system prompts - let HF data speak naturally
+
+        Args:
+            messages: Conversation messages
+            source: "local" or "hf" - determines persona handling
+
+        Returns:
+            Messages with appropriate persona handling
+        """
+        if source == "local":
+            # Keep original production prompts exactly as-is
+            # Local logs have JAR, Config Agent, Taxonomy Expert, etc.
+            return messages
+
+        # For HF data: strip generic system prompts
+        # HF samples often have "You are a helpful assistant" which we remove
+        # to avoid polluting the hidden state space
+        return [msg for msg in messages if msg.get("role") != "system"]
+
     def _generate_loss_mask(self, messages: List[Dict[str, Any]]) -> List[int]:
         """
-        EAGLE Preparation: Generate loss mask array.
-
-        Creates a token-level mask for training:
-        - 0: system and user tokens (don't predict)
-        - 1: assistant tokens (predict these)
-        - 0: tool output tokens (don't predict system's database results)
-
-        Note: This generates a rough token estimate. For precise token-level
-        masking, a tokenizer would be needed. This uses character count as proxy.
+        DEPRECATED: Character-level loss mask. Kept for backward compatibility.
+        Use _generate_loss_mask_segments() for EAGLE training.
         """
         mask = []
-
         for msg in messages:
             role = msg.get("role", "")
             content = msg.get("content", "") or ""
-
-            if role == "system":
-                # System messages - don't predict
-                mask.extend([0] * len(content))
-            elif role == "user":
-                # User messages - don't predict
-                mask.extend([0] * len(content))
-            elif role == "assistant":
-                # Assistant messages - predict (including tool_calls)
+            if role == "assistant":
                 mask.extend([1] * len(content))
-
-                # Include tool_calls content if present
-                if msg.get("tool_calls"):
-                    for tc in msg["tool_calls"]:
-                        func = tc.get("function", {})
-                        args = func.get("arguments", "")
-                        if args:
-                            if isinstance(args, str):
-                                mask.extend([1] * len(args))
-                            else:
-                                mask.extend([1] * len(json.dumps(args)))
-
-            elif role == "tool":
-                # Tool results - don't predict (these are system outputs)
+            else:
                 mask.extend([0] * len(content))
-
         return mask
 
     def _get_user_hash(self, messages: List[Dict[str, Any]]) -> str:
@@ -1588,11 +1621,15 @@ class EAGLEDistiller:
         # Hash it
         return hashlib.sha256(normalized.encode()).hexdigest()
 
-    def _process_sample(self, raw_data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    def _process_sample(self, raw_data: Dict[str, Any], source: str = "local") -> Optional[Dict[str, Any]]:
         """
         Process a single raw sample through the full cleaning pipeline.
 
-        Returns cleaned sample with loss mask, or None if filtered.
+        Args:
+            raw_data: Raw sample data
+            source: "local" or "hf" - controls persona handling
+
+        Returns cleaned sample with segment-based loss masks, or None if filtered.
         """
         self.stats["total_processed"] += 1
 
@@ -1606,14 +1643,19 @@ class EAGLEDistiller:
         if not messages:
             return None
 
-        # Step 3: Check for error content
+        # Step 3: Source-Aware Persona Management
+        # Local: Keep original production prompts
+        # HF: Strip generic system prompts
+        messages = self._inject_jar_persona(messages, source)
+
+        # Step 4: Check for error content
         if not self._check_error_content(messages):
             return None
 
-        # Step 4: Adaptive Persona Trimming - remove filler phrases
+        # Step 5: Adaptive Persona Trimming - remove filler phrases
         messages = self._trim_filler_phrases(messages)
 
-        # Step 5: Structural Heuristics
+        # Step 6: Structural Heuristics
         if not self._check_tool_integrity(messages):
             return None
 
@@ -1623,13 +1665,13 @@ class EAGLEDistiller:
         if not self._check_response_length(messages):
             return None
 
-        # Step 6: Generate loss mask
-        loss_mask = self._generate_loss_mask(messages)
+        # Step 7: Generate SEGMENT-BASED loss mask for token alignment
+        loss_mask_segments = self._generate_loss_mask_segments(messages)
 
-        # Prepare output in OpenAI format
+        # Prepare output in unified OpenAI format
         return {
             "messages": messages,
-            "loss_mask": loss_mask
+            "loss_mask_segments": loss_mask_segments
         }
 
     def _filter_and_refill(
@@ -1720,22 +1762,19 @@ class EAGLEDistiller:
         )
         print(f"  Produced {len(clean_samples)} clean samples")
 
-        # Save golden dataset
-        print(f"\n[3/5] Saving golden dataset...")
-        golden_path = os.path.join(self.output_dir, "golden_dataset.jsonl")
-        with open(golden_path, 'w', encoding='utf-8') as f:
+        # Save unified dataset (messages + loss_mask_segments combined)
+        print(f"\n[3/5] Saving unified dataset...")
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        dataset_filename = f"dataset_{timestamp}.jsonl"
+        dataset_path = os.path.join(self.output_dir, dataset_filename)
+        with open(dataset_path, 'w', encoding='utf-8') as f:
             for sample in clean_samples:
-                # Save only messages (OpenAI format)
-                f.write(json.dumps({"messages": sample["messages"]}, ensure_ascii=False) + "\n")
-        print(f"  Saved to: {golden_path}")
-
-        # Save loss masks
-        print(f"\n[4/5] Saving loss masks...")
-        masks_path = os.path.join(self.output_dir, "loss_masks.jsonl")
-        with open(masks_path, 'w', encoding='utf-8') as f:
-            for sample in clean_samples:
-                f.write(json.dumps({"loss_mask": sample["loss_mask"]}, ensure_ascii=False) + "\n")
-        print(f"  Saved to: {masks_path}")
+                # Unified format: messages + segment-based masks for token alignment
+                f.write(json.dumps({
+                    "messages": sample["messages"],
+                    "loss_mask_segments": sample["loss_mask_segments"]
+                }, ensure_ascii=False) + "\n")
+        print(f"  Saved to: {dataset_path}")
 
         # Final statistics
         print(f"\n[5/5] Statistics:")
@@ -1751,8 +1790,7 @@ class EAGLEDistiller:
         self.stats["final_count"] = len(clean_samples)
 
         return {
-            "golden_dataset": golden_path,
-            "loss_masks": masks_path,
+            "dataset": dataset_filename,
             "statistics": self.stats
         }
 
