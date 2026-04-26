@@ -6,7 +6,10 @@ data/raw/
 data/processed/
 data/features/
 data/output/
-
+venv/
+checkpoints/
+models_cache/
+checkpoints_gemma/
 # Output directory
 output/*
 
