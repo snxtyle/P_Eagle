@@ -122,6 +122,15 @@ class PEAGLEInference:
         return output_text, metrics
 
     def _generate_draft_parallel(self, input_ids, k):
+        """Generate K draft tokens using parallel MTP heads.
+
+        ARCHITECTURE NOTE: P-EAGLE drafter predicts HIDDEN STATES, not tokens.
+        The target model's lm_head converts these to target-vocab tokens.
+        This design requires COMPATIBLE vocabularies between drafter and target.
+
+        For incompatible vocabularies, use a shared tokenizer (specified in feature
+        extraction) and ensure both models can process those token IDs.
+        """
         draft_tokens = []
         current_ids = input_ids.clone()
 
@@ -134,12 +143,15 @@ class PEAGLEInference:
             else:
                 pred_hidden = projected
 
+            # Convert predicted hidden state to logits using target's lm_head
+            # This matches training: we train to predict hidden states that,
+            # when passed through target's lm_head, produce correct tokens
             logits = self._hidden_to_logits(pred_hidden)
             probs = F.softmax(logits[0, 0], dim=-1)
             token = torch.multinomial(probs, num_samples=1).item()
 
             draft_tokens.append(token)
-            current_ids = torch.cat([current_ids, torch.tensor([[token]], device=self.device)], dim=1)
+            current_ids = torch.cat([current_ids, torch.tensor([[token]], device=self.device)], dim=1])
 
         return draft_tokens, logits
 

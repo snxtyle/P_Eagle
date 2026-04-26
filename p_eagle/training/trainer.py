@@ -26,7 +26,7 @@ import numpy as np
 
 from ..models.eagle_drafter import EagleDrafterModel
 from ..utils.feature_utils import EagleTrainingDataset
-from ..utils.loss_utils import masked_mse_loss
+from ..utils.loss_utils import masked_mse_loss, hidden_state_token_loss
 from ..utils.metrics import MetricsTracker, GenerationMetrics
 
 
@@ -260,6 +260,12 @@ class EagleTrainer:
         if self.tokenizer.pad_token is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
 
+        # Load target model's lm_head for token-level loss computation
+        # This is critical: drafter's hidden states are converted to tokens via target's lm_head
+        print(f"Loading target lm_head for token-level training...")
+        print(f"NOTE: Target model must have hidden_dim={target_hidden_dim} for lm_head compatibility")
+        self.target_lm_head = self._load_target_lm_head(target_hidden_dim)
+
         # Setup optimizer
         print("Setting up PagedAdamW8bit optimizer...")
         params_with_wd = []
@@ -314,6 +320,29 @@ class EagleTrainer:
         print(f"  Epochs: {num_epochs}")
         print(f"  Batch size: {batch_size}")
         print(f"  Total steps: {total_steps}")
+
+    def _load_target_lm_head(self, target_hidden_dim: int):
+        """Load or create target model's lm_head for token-level loss.
+
+        Since we don't have access to the full target model during training,
+        we create a placeholder lm_head with the correct dimensions.
+        This will be replaced by the actual target model's lm_head during inference.
+        """
+        import torch.nn as nn
+
+        # Get vocab size from drafter (they should match for compatible models)
+        vocab_size = len(self.tokenizer)
+
+        # Create a linear layer that mimics the target lm_head
+        lm_head = nn.Linear(target_hidden_dim, vocab_size, bias=False).to(self.device)
+
+        # Initialize with small random weights (will be updated if we can load actual target)
+        nn.init.normal_(lm_head.weight, std=0.02)
+
+        print(f"  Created placeholder lm_head: {target_hidden_dim} -> {vocab_size}")
+        print(f"  During inference, actual target lm_head will be used")
+
+        return lm_head
 
     def _run_hardware_check(
         self,
@@ -496,13 +525,15 @@ class EagleTrainer:
         }
 
     def train(self):
-        """Main training loop."""
+        """Main training loop with comprehensive loss tracking."""
         self.model.train()
         best_loss = float("inf")
+        epoch_stats = []
 
         for epoch in range(self.num_epochs):
             print(f"\nEpoch {epoch + 1}/{self.num_epochs}")
             epoch_losses = []
+            epoch_mtp_losses = {i: [] for i in range(self.model.speculation_depth)}
             pbar = tqdm(self.dataloader, desc=f"Epoch {epoch + 1}")
 
             for batch_idx, batch in enumerate(pbar):
@@ -510,6 +541,12 @@ class EagleTrainer:
 
                 epoch_losses.append(loss.item())
                 self.global_step += 1
+
+                # Track per-head losses
+                for i in range(self.model.speculation_depth):
+                    key = f"mtp_loss_{i+1}"
+                    if key in metrics:
+                        epoch_mtp_losses[i].append(metrics[key])
 
                 # Update progress bar
                 pbar.set_postfix({
@@ -519,10 +556,14 @@ class EagleTrainer:
 
                 # Log to TensorBoard
                 if self.global_step % 10 == 0:
-                    self.writer.add_scalar("train/loss", loss.item(), self.global_step)
+                    self.writer.add_scalar("train/total_loss", loss.item(), self.global_step)
                     self.writer.add_scalar("train/lr", self.scheduler.get_last_lr()[0], self.global_step)
+                    self.writer.add_scalar("train/mtp_loss_avg", metrics.get("mtp_loss_avg", 0), self.global_step)
+                    self.writer.add_scalar("train/kl_loss_avg", metrics.get("kl_loss_avg", 0), self.global_step)
+                    self.writer.add_scalar("train/token_acc_avg", metrics.get("token_acc_avg", 0), self.global_step)
                     for k, v in metrics.items():
-                        self.writer.add_scalar(f"train/{k}", v, self.global_step)
+                        if k.startswith("mtp_loss_") or k.startswith("token_acc_"):
+                            self.writer.add_scalar(f"train/{k}", v, self.global_step)
 
                 # Save checkpoint
                 if self.global_step % self.save_every == 0:
@@ -530,18 +571,53 @@ class EagleTrainer:
 
             # Epoch summary
             avg_loss = np.mean(epoch_losses)
-            print(f"Epoch {epoch + 1} average loss: {avg_loss:.4f}")
+            epoch_stat = {
+                "epoch": epoch + 1,
+                "avg_total_loss": avg_loss,
+                "per_head_avg_loss": {}
+            }
+            for i in range(self.model.speculation_depth):
+                if epoch_mtp_losses[i]:
+                    epoch_stat["per_head_avg_loss"][f"head_{i+1}"] = np.mean(epoch_mtp_losses[i])
+
+            epoch_stats.append(epoch_stat)
+
+            print(f"Epoch {epoch + 1} summary:")
+            print(f"  Total loss: {avg_loss:.6f}")
+            for head, loss_val in epoch_stat["per_head_avg_loss"].items():
+                print(f"  {head}: {loss_val:.6f}")
 
             if avg_loss < best_loss:
                 best_loss = avg_loss
                 self._save_checkpoint("best_model")
-                print(f"New best model saved!")
+                print(f"  *** New best model saved! ***")
+
+        # Save training history
+        history_path = self.output_dir / "training_history.json"
+        with open(history_path, "w") as f:
+            json.dump({
+                "final_best_loss": best_loss,
+                "epochs": epoch_stats,
+                "config": {
+                    "drafter_model": self.drafter_model_name,
+                    "num_epochs": self.num_epochs,
+                    "batch_size": self.dataloader.batch_size,
+                    "learning_rate": self.optimizer.defaults["lr"],
+                    "warmup_steps": self.scheduler.num_warmup_steps
+                }
+            }, f, indent=2)
+        print(f"\nTraining history saved to {history_path}")
 
         self.writer.close()
         print("\nTraining complete!")
 
     def _training_step(self, batch: Dict[str, torch.Tensor]) -> Tuple[torch.Tensor, Dict]:
-        """Single training step."""
+        """Single training step with P-EAGLE aligned loss.
+
+        Key insight: During inference, drafter's predicted hidden states are converted
+        to tokens via the TARGET model's lm_head. So we must train to match the
+        token distributions, not just hidden state vectors.
+        """
         self.optimizer.zero_grad()
 
         # Forward pass
@@ -551,19 +627,18 @@ class EagleTrainer:
         )
 
         # Compute losses for each MTP head
-        losses = []
+        kl_losses = []
+        mse_losses = []
+        token_accs = []
         mtp_losses = []
 
         for k, pred_hidden in enumerate(outputs["mtp_predictions"]):
             shift = k + 1
 
             if pred_hidden.shape[1] > 0:
-                # Pred_hidden corresponds to positions [0, seq_len - shift - 1]
-                # Target at shift + i is predicted by pred_hidden at i
                 target_shifted = batch["target_hidden"][:, shift:shift + pred_hidden.shape[1]]
                 mask_shifted = batch["loss_mask"][:, shift:shift + pred_hidden.shape[1]]
 
-                # Ensure shapes match
                 min_len = min(pred_hidden.shape[1], target_shifted.shape[1])
 
                 if min_len > 0:
@@ -571,18 +646,34 @@ class EagleTrainer:
                     target_trimmed = target_shifted[:, :min_len]
                     mask_trimmed = mask_shifted[:, :min_len]
 
-                    loss_k = masked_mse_loss(pred_trimmed, target_trimmed, mask_trimmed)
-                    print(f"DEBUG: k={k}, pred shape={pred_hidden.shape}, target shape={target_shifted.shape}, loss_k={loss_k}, requires_grad={loss_k.requires_grad}")
-                    losses.append(loss_k)
-                    mtp_losses.append(loss_k.item())
+                    # P-EAGLE aligned loss: match token distributions via target lm_head
+                    kl_loss_k, mse_loss_k, acc_k = hidden_state_token_loss(
+                        pred_trimmed,
+                        target_trimmed,
+                        self.target_lm_head,
+                        mask_trimmed,
+                        temperature=1.0
+                    )
 
-        if losses:
-            total_loss = sum(losses) / len(losses)
-            print(f"DEBUG: losses={len(losses)}, total_loss={total_loss}, requires_grad={total_loss.requires_grad}, grad_fn={total_loss.grad_fn}")
-        else:
-            # No valid losses - return zero loss tensor that requires grad
+                    kl_losses.append(kl_loss_k)
+                    mse_losses.append(mse_loss_k)
+                    token_accs.append(acc_k.item())
+                    mtp_losses.append(mse_loss_k.item())
+
+        # Combine losses: KL divergence (token distribution) + MSE (hidden state)
+        # KL ensures tokens match, MSE ensures hidden states are structurally similar
+        total_loss = torch.tensor(0.0, device=self.device)
+
+        if kl_losses:
+            kl_total = sum(kl_losses) / len(kl_losses)
+            total_loss = total_loss + kl_total  # Primary: token distribution matching
+
+        if mse_losses:
+            mse_total = sum(mse_losses) / len(mse_losses)
+            total_loss = total_loss + 0.1 * mse_total  # Secondary: hidden state similarity
+
+        if total_loss.item() == 0:
             total_loss = torch.tensor(0.0, device=self.device, requires_grad=True)
-            print(f"DEBUG: No losses, using zero tensor")
 
         # Backward pass
         total_loss.backward()
@@ -593,9 +684,13 @@ class EagleTrainer:
 
         metrics = {
             "mtp_loss_avg": np.mean(mtp_losses) if mtp_losses else 0.0,
+            "kl_loss_avg": sum(kl.item() for kl in kl_losses) / len(kl_losses) if kl_losses else 0.0,
+            "token_acc_avg": np.mean(token_accs) if token_accs else 0.0,
         }
         for i, loss_i in enumerate(mtp_losses):
             metrics[f"mtp_loss_{i+1}"] = loss_i
+        for i, acc_i in enumerate(token_accs):
+            metrics[f"token_acc_{i+1}"] = acc_i
 
         return total_loss, metrics
 

@@ -56,6 +56,7 @@ class FeatureExtractor:
         self,
         model_name: str,
         output_dir: str,
+        tokenizer_name: str = None,
         quantization: str = "4bit",
         layer_config: str = "early,middle,final",
         fusion_mode: str = "mean",
@@ -79,7 +80,10 @@ class FeatureExtractor:
         if HF_TOKEN:
             print("Using HF token from .env file")
 
-        self.tokenizer = AutoTokenizer.from_pretrained(model_name, token=HF_TOKEN)
+        # Use drafter's tokenizer to ensure compatibility during training
+        tokenizer_to_use = tokenizer_name if tokenizer_name else model_name
+        print(f"Loading tokenizer: {tokenizer_to_use}")
+        self.tokenizer = AutoTokenizer.from_pretrained(tokenizer_to_use, token=HF_TOKEN)
         if self.tokenizer.pad_token is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
 
@@ -95,6 +99,7 @@ class FeatureExtractor:
 
         self.layer_config = TriLayerConfig(self.model, layer_config)
         print(f"Model loaded. Hidden dim: {self.model.config.hidden_size}")
+        print(f"Tokenizer vocab size: {len(self.tokenizer)}")
 
     def _setup_quantization(self, mode: str):
         if mode == "4bit":
@@ -247,6 +252,7 @@ class FeatureExtractor:
 def main():
     parser = argparse.ArgumentParser(description="P-EAGLE Feature Extraction")
     parser.add_argument("--model_path", required=True)
+    parser.add_argument("--tokenizer_path", default=None, help="Tokenizer to use (defaults to model_path). Use drafter model for compatibility.")
     parser.add_argument("--input_data", required=True)
     parser.add_argument("--output_dir", default="./features")
     parser.add_argument("--quantization", default="4bit", choices=["4bit", "8bit", "none"])
@@ -261,6 +267,7 @@ def main():
     extractor = FeatureExtractor(
         model_name=args.model_path,
         output_dir=args.output_dir,
+        tokenizer_name=args.tokenizer_path,
         quantization=args.quantization,
         layer_config=args.layers,
         fusion_mode=args.fusion,

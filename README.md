@@ -260,6 +260,28 @@ Higher K = more parallelism but diminishing returns if acceptance drops.
 
 ---
 
+## Visualizations
+
+Generate plots for the Gemma 2B IT → Gemma 7B model pair:
+
+```bash
+python -m plot_scripts.generate_plots
+```
+
+| Training Loss | Evaluation Metrics |
+|:-------------:|:------------------:|
+| ![Training](plot_scripts/plots/training_loss.png) | ![Eval](plot_scripts/plots/evaluation_metrics.png) |
+| Tracks convergence during training | Shows token acceptance rates and speedup |
+
+To compare two configurations:
+```bash
+python -m plot_scripts.generate_plots --mode compare \
+    --model1 results/config_a.json --model2 results/config_b.json \
+    --model1_name "LoRA r=64" --model2_name "LoRA r=128"
+```
+
+---
+
 ## Performance
 
 ### Expected Metrics
@@ -279,6 +301,20 @@ On NVIDIA A100-80GB, batch_size=1:
 | Gemma-7B | Qwen-1.5B | 4 | 3.2 | 2.1x |
 | Llama-2-7B | Qwen-1.5B | 4 | 2.9 | 1.9x |
 | Mistral-7B | Phi-2 | 4 | 3.0 | 1.8x |
+
+### Latest Evaluation (April 2026)
+
+Evaluated P-EAGLE drafter on `google/gemma-7b` with K=4:
+
+| Metric | Value |
+|--------|-------|
+| Mean Acceptance Length (MAL) | **3.50** |
+| Head 1 Acceptance | 100% |
+| Heads 2-4 Acceptance | 83.2% |
+| Throughput | 6.8-14.5 tok/s |
+| Speedup vs Autoregressive | 1.9x - 4.0x |
+
+> ⚠️ **Known Issue:** While speculative decoding mechanics are working (high MAL), output quality is degraded. See [EVALUATION_REPORT.md](EVALUATION_REPORT.md) for detailed analysis and recommendations.
 
 ---
 
@@ -305,7 +341,22 @@ p_eagle/
 │   └── scripts/                  # CLI entry points
 │       ├── extract_features.py
 │       ├── train_drafter.py
-│       └── run_inference.py
+│       ├── run_inference.py
+│       ├── evaluate.py
+│       ├── plot_metrics.py       # Legacy plotting
+│       └── compare_models.py     # Legacy comparison
+├── plot_scripts/                 # Visualization scripts
+│   ├── __init__.py
+│   ├── utils.py                  # Data loading utilities
+│   ├── plot_training.py          # Training curve plots
+│   ├── plot_evaluation.py        # Evaluation metric plots
+│   ├── plot_comparison.py        # Multi-model comparison
+│   ├── generate_plots.py         # Unified plot generator
+│   └── plots/                    # Generated plots
+│       ├── *_training.png
+│       ├── *_mtp_losses.png
+│       ├── *_acceptance.png
+│       └── *_dashboard.png
 ├── scripts/                      # Standalone scripts
 │   └── generate_data.py          # Dataset generation
 ├── data/                         # Data directories

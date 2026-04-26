@@ -120,13 +120,32 @@ output, metrics = engine.generate("Hello, world!", max_new_tokens=50)
 
 ## CLI Scripts (`p_eagle/scripts/`)
 
-These are entry points for the three-stage pipeline:
+These are entry points for the three-stage pipeline plus evaluation:
 
 | Script | Command | Purpose |
 |--------|---------|---------|
 | `extract_features.py` | `python -m p_eagle.scripts.extract_features` | Stage 1: Feature extraction |
 | `train_drafter.py` | `python -m p_eagle.scripts.train_drafter` | Stage 2: Drafter training |
 | `run_inference.py` | `python -m p_eagle.scripts.run_inference` | Stage 3: Speculative decoding |
+| `evaluate.py` | `python -m p_eagle.scripts.evaluate` | Benchmark and evaluate drafter |
+
+### Evaluation Script
+
+The `evaluate.py` script measures:
+- **Mean Acceptance Length (MAL):** Average tokens accepted per speculation
+- **Per-head acceptance rates:** How often each position is accepted
+- **Throughput:** Tokens per second
+- **Domain-specific tests:** Juspay log pattern recognition
+
+```bash
+python -m p_eagle.scripts.evaluate \
+    --drafter_checkpoint ./checkpoints_gemma/best_model \
+    --target_model "google/gemma-7b" \
+    --baseline \
+    --output evaluation_results.json
+```
+
+See [EVALUATION_REPORT.md](../EVALUATION_REPORT.md) for example results.
 
 ## Data Directories
 
@@ -184,12 +203,47 @@ Saved model states during and after training.
 checkpoints/
 ├── best_model/                   # Best validation loss
 │   ├── adapter_model/            # LoRA weights
+│   │   ├── README.md
+│   │   ├── adapter_config.json
+│   │   └── adapter_model.safetensors
+│   ├── lora_weights/             # Alternative LoRA storage
+│   │   ├── adapter_config.json
+│   │   └── adapter_model.safetensors
 │   ├── dimension_projection.pt
 │   ├── mtp_heads/
 │   └── config.json
 ├── checkpoint_step_1000/         # Periodic checkpoint
 └── final_model/                  # Last epoch
 ```
+
+### Actual Checkpoint Structure (`checkpoints_gemma/`)
+
+Real checkpoint from Gemma-2-2B training:
+
+```
+checkpoints_gemma/
+└── best_model/
+    ├── adapter_model/
+    │   ├── README.md
+    │   ├── adapter_config.json
+    │   └── adapter_model.safetensors
+    ├── lora_weights/
+    │   ├── adapter_config.json
+    │   └── adapter_model.safetensors
+    ├── mtp_heads/
+    │   ├── head_0.pt
+    │   ├── head_1.pt
+    │   ├── head_2.pt
+    │   └── head_3.pt
+    ├── dimension_projection.pt
+    └── config.json
+```
+
+**Key Files:**
+- `adapter_model.safetensors` - LoRA fine-tuned weights
+- `mtp_heads/*.pt` - Individual head parameters for each speculation depth
+- `dimension_projection.pt` - Projection layer from drafter to target dimension
+- `config.json` - Training configuration and hyperparameters
 
 ## Logs (`logs/`)
 
