@@ -138,8 +138,8 @@ class PEAGLEInference:
         PARALLEL EXECUTION: This performs ONE forward pass on the drafter and
         extracts all K predictions from the mtp_predictions list simultaneously.
         """
-        # Single forward pass on the drafter
-        outputs = self.drafter(input_ids, output_hidden_states=True)
+        # Single forward pass on the drafter (inference mode - no trimming)
+        outputs = self.drafter(input_ids, output_hidden_states=True, is_training=False)
 
         draft_tokens = []
         last_logits = None
@@ -189,14 +189,14 @@ class PEAGLEInference:
 
         verified_tokens = []
         for i in range(min(num_draft, logits.shape[0])):
-            target_probs = F.softmax(logits[i] / temperature, dim=-1)
-            target_token_prob = target_probs[draft_tokens[i]].item()
+            # GREEDY VERIFICATION: Accept only if draft token matches target's top choice
+            target_token = torch.argmax(logits[i]).item()
 
-            if target_token_prob > 0.0:
+            if draft_tokens[i] == target_token:
                 verified_tokens.append(draft_tokens[i])
             else:
-                corrected_token = torch.multinomial(target_probs, num_samples=1).item()
-                verified_tokens.append(corrected_token)
+                # Target model disagrees - accept up to this point and use target's choice
+                verified_tokens.append(target_token)
                 break
 
         return len(verified_tokens), verified_tokens

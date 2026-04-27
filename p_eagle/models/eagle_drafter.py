@@ -209,7 +209,8 @@ class EagleDrafterModel(nn.Module):
         input_ids: torch.Tensor,
         attention_mask: Optional[torch.Tensor] = None,
         target_hidden: Optional[torch.Tensor] = None,
-        output_hidden_states: bool = True
+        output_hidden_states: bool = True,
+        is_training: bool = True
     ) -> Dict[str, torch.Tensor]:
         """
         Forward pass with optional target hidden state injection.
@@ -220,6 +221,7 @@ class EagleDrafterModel(nn.Module):
             target_hidden: Optional target model hidden states [batch, seq_len, target_hidden_dim]
                            When provided, injects this into drafter's hidden states
             output_hidden_states: Whether to return hidden states
+            is_training: If True, apply trimming for training. If False, use last hidden state for inference.
 
         Returns:
             Dictionary containing base_hidden, projected_hidden, mtp_predictions, lm_logits
@@ -257,11 +259,17 @@ class EagleDrafterModel(nn.Module):
 
         mtp_predictions = []
         for k, mtp_head in enumerate(self.mtp_heads):
-            # Trim projected_hidden to match shifted targets: h_t predicts h_{t+k+1}
-            # For target at position i, we need prediction at position i-k-1
-            # Valid positions for k-th head: [0, seq_len - k - 1]
-            trim = k + 1
-            pred_input = projected_hidden[:, :-trim] if trim > 0 else projected_hidden
+            if is_training:
+                # TRAINING: Trim projected_hidden to match shifted targets: h_t predicts h_{t+k+1}
+                # For target at position i, we need prediction at position i-k-1
+                # Valid positions for k-th head: [0, seq_len - k - 1]
+                trim = k + 1
+                pred_input = projected_hidden[:, :-trim] if trim > 0 else projected_hidden
+            else:
+                # INFERENCE: Use the last hidden state to predict future tokens
+                # Each MTP head generates the (k+1)-th future token from the current position
+                pred_input = projected_hidden[:, -1:]
+
             pred = mtp_head(pred_input)
             mtp_predictions.append(pred)
 
@@ -279,7 +287,7 @@ class EagleDrafterModel(nn.Module):
         num_tokens: int = 1
     ) -> torch.Tensor:
         assert 1 <= num_tokens <= self.speculation_depth
-        outputs = self.forward(input_ids, attention_mask)
+        outputs = self.forward(input_ids, attention_mask, is_training=False)
         return outputs["mtp_predictions"][num_tokens - 1]
 
     def save_checkpoint(self, checkpoint_dir: str):

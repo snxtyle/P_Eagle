@@ -656,7 +656,8 @@ class EagleTrainer:
         outputs = self.model(
             input_ids=batch["input_ids"],
             attention_mask=batch["attention_mask"],
-            target_hidden=batch["target_hidden"]
+            target_hidden=batch["target_hidden"],
+            is_training=True
         )
 
         # Compute losses for each MTP head
