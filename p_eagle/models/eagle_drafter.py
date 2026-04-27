@@ -113,6 +113,7 @@ class EagleDrafterModel(nn.Module):
     1. Base LLM (frozen or LoRA-tuned)
     2. Linear projection to match target dimension
     3. K parallel MTP heads for predicting h_{t+1}, ..., h_{t+K}
+    4. Optional: Hidden state injection from target model for distillation
     """
 
     def __init__(
@@ -124,13 +125,17 @@ class EagleDrafterModel(nn.Module):
         lora_rank: int = 64,
         lora_alpha: int = 128,
         lora_dropout: float = 0.05,
-        device: str = "cuda"
+        device: str = "cuda",
+        use_hidden_injection: bool = False,
+        injection_mode: str = "concat"
     ):
         super().__init__()
 
         self.speculation_depth = speculation_depth
         self.target_hidden_dim = target_hidden_dim
         self.device = device
+        self.use_hidden_injection = use_hidden_injection
+        self.injection_mode = injection_mode
 
         # Use local cache to avoid re-downloading
         import os
@@ -172,6 +177,26 @@ class EagleDrafterModel(nn.Module):
         # Initialize projection and heads with same dtype as base model (bfloat16)
         self.dim_projection = nn.Linear(self.hidden_dim, target_hidden_dim, dtype=torch.bfloat16).to(device)
 
+        # Hidden state injection for distillation
+        if use_hidden_injection:
+            if injection_mode == "concat":
+                # Project concatenated [drafter_hidden; target_hidden] to target_hidden_dim
+                self.hidden_injection = nn.Linear(
+                    self.hidden_dim + target_hidden_dim,
+                    self.hidden_dim,
+                    dtype=torch.bfloat16
+                ).to(device)
+            elif injection_mode == "add":
+                # Project target_hidden to drafter's hidden_dim for addition
+                self.hidden_injection = nn.Linear(
+                    target_hidden_dim,
+                    self.hidden_dim,
+                    dtype=torch.bfloat16
+                ).to(device)
+            else:
+                raise ValueError(f"Unknown injection_mode: {injection_mode}")
+            print(f"Hidden state injection enabled: {injection_mode} mode")
+
         self.mtp_heads = nn.ModuleList([
             EagleMTPHead(target_hidden_dim, target_hidden_dim, num_layers=2, dtype=torch.bfloat16).to(device)
             for _ in range(speculation_depth)
@@ -183,9 +208,22 @@ class EagleDrafterModel(nn.Module):
         self,
         input_ids: torch.Tensor,
         attention_mask: Optional[torch.Tensor] = None,
+        target_hidden: Optional[torch.Tensor] = None,
         output_hidden_states: bool = True
     ) -> Dict[str, torch.Tensor]:
+        """
+        Forward pass with optional target hidden state injection.
 
+        Args:
+            input_ids: Token IDs [batch, seq_len]
+            attention_mask: Attention mask [batch, seq_len]
+            target_hidden: Optional target model hidden states [batch, seq_len, target_hidden_dim]
+                           When provided, injects this into drafter's hidden states
+            output_hidden_states: Whether to return hidden states
+
+        Returns:
+            Dictionary containing base_hidden, projected_hidden, mtp_predictions, lm_logits
+        """
         outputs = self.base_model(
             input_ids=input_ids,
             attention_mask=attention_mask,
@@ -193,6 +231,28 @@ class EagleDrafterModel(nn.Module):
         )
 
         base_hidden = outputs.hidden_states[-1]
+
+        # Apply hidden state injection if target_hidden is provided and injection is enabled
+        if target_hidden is not None and self.use_hidden_injection:
+            # Ensure target_hidden matches base_hidden sequence length
+            min_len = min(base_hidden.shape[1], target_hidden.shape[1])
+            base_trimmed = base_hidden[:, :min_len]
+            target_trimmed = target_hidden[:, :min_len].to(base_hidden.dtype)
+
+            if self.injection_mode == "concat":
+                # Concatenate drafter hidden and target hidden, then project
+                combined = torch.cat([base_trimmed, target_trimmed], dim=-1)
+                injected = self.hidden_injection(combined)
+                # Pad back to original length if needed
+                if min_len < base_hidden.shape[1]:
+                    padding = base_hidden[:, min_len:]
+                    injected = torch.cat([injected, padding], dim=1)
+                base_hidden = injected
+            elif self.injection_mode == "add":
+                # Project target hidden to match drafter hidden dim, then add
+                projected_target = self.hidden_injection(target_trimmed)
+                base_hidden[:, :min_len] = base_hidden[:, :min_len] + projected_target
+
         projected_hidden = self.dim_projection(base_hidden)
 
         mtp_predictions = []
@@ -232,19 +292,29 @@ class EagleDrafterModel(nn.Module):
         if isinstance(self.base_model, PeftModel):
             self.base_model.save_pretrained(Path(checkpoint_dir) / "lora_weights")
 
-        torch.save({
+        checkpoint_data = {
             "dim_projection": self.dim_projection.state_dict(),
             "mtp_heads": [head.state_dict() for head in self.mtp_heads],
             "speculation_depth": self.speculation_depth,
             "hidden_dim": self.hidden_dim,
-            "target_hidden_dim": self.target_hidden_dim
-        }, Path(checkpoint_dir) / "eagle_heads.pt")
+            "target_hidden_dim": self.target_hidden_dim,
+            "use_hidden_injection": self.use_hidden_injection,
+            "injection_mode": self.injection_mode
+        }
+
+        # Save hidden injection layer if enabled
+        if self.use_hidden_injection:
+            checkpoint_data["hidden_injection"] = self.hidden_injection.state_dict()
+
+        torch.save(checkpoint_data, Path(checkpoint_dir) / "eagle_heads.pt")
 
         config = {
             "base_model": self.base_model.name_or_path if hasattr(self.base_model, 'name_or_path') else "unknown",
             "speculation_depth": self.speculation_depth,
             "hidden_dim": self.hidden_dim,
-            "target_hidden_dim": self.target_hidden_dim
+            "target_hidden_dim": self.target_hidden_dim,
+            "use_hidden_injection": self.use_hidden_injection,
+            "injection_mode": self.injection_mode
         }
         with open(Path(checkpoint_dir) / "config.json", "w") as f:
             json.dump(config, f, indent=2)
@@ -258,12 +328,18 @@ class EagleDrafterModel(nn.Module):
         with open(Path(checkpoint_dir) / "config.json") as f:
             config = json.load(f)
 
+        # Load hidden injection settings from checkpoint (default to False for backward compat)
+        use_hidden_injection = config.get("use_hidden_injection", False)
+        injection_mode = config.get("injection_mode", "concat")
+
         model = cls(
             base_model_name=config["base_model"],
             target_hidden_dim=config["target_hidden_dim"],
             speculation_depth=config["speculation_depth"],
             use_lora=False,
-            device=device
+            device=device,
+            use_hidden_injection=use_hidden_injection,
+            injection_mode=injection_mode
         )
 
         checkpoint = torch.load(
@@ -274,5 +350,9 @@ class EagleDrafterModel(nn.Module):
         model.dim_projection.load_state_dict(checkpoint["dim_projection"])
         for i, head_state in enumerate(checkpoint["mtp_heads"]):
             model.mtp_heads[i].load_state_dict(head_state)
+
+        # Load hidden injection layer if present
+        if use_hidden_injection and "hidden_injection" in checkpoint:
+            model.hidden_injection.load_state_dict(checkpoint["hidden_injection"])
 
         return model

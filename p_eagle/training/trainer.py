@@ -620,10 +620,12 @@ class EagleTrainer:
         """
         self.optimizer.zero_grad()
 
-        # Forward pass
+        # Forward pass with optional target hidden state injection
+        # target_hidden is passed as input for hidden state injection during distillation
         outputs = self.model(
             input_ids=batch["input_ids"],
-            attention_mask=batch["attention_mask"]
+            attention_mask=batch["attention_mask"],
+            target_hidden=batch["target_hidden"]
         )
 
         # Compute losses for each MTP head

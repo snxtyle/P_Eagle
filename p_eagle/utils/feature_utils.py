@@ -144,11 +144,16 @@ class EagleTrainingDataset(Dataset):
             input_ids = sample["input_ids"][:target_len]
             attention_mask = sample["attention_mask"][:target_len]
 
+        # Target hidden states are used for both:
+        # 1. Hidden state injection during forward pass (if enabled)
+        # 2. Ground truth for MTP loss calculation
+        target_hidden = sample["fused_hidden_states"][:target_len]
+
         return {
             "input_ids": input_ids,
-            "target_hidden": sample["fused_hidden_states"][:target_len],
-            "loss_mask": sample["loss_mask"][:target_len],
-            "attention_mask": attention_mask
+            "attention_mask": attention_mask,
+            "target_hidden": target_hidden,
+            "loss_mask": sample["loss_mask"][:target_len]
         }
 
 

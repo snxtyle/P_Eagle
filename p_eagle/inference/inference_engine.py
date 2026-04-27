@@ -11,6 +11,7 @@ import torch.nn.functional as F
 from transformers import AutoTokenizer, AutoModelForCausalLM
 
 from ..models.eagle_drafter import EagleDrafterModel
+from ..models.tree_attention import TreeAttentionMask
 
 
 @dataclass
@@ -57,6 +58,9 @@ class PEAGLEInference:
 
         self.speculation_depth = self.drafter.speculation_depth
         self.acceptance_history = []
+
+        # Initialize tree attention for parallel verification
+        self.tree_attention = TreeAttentionMask(self.speculation_depth)
 
         print(f"P-EAGLE initialized: Target={target_model_name}, K={self.speculation_depth}")
 
@@ -122,7 +126,7 @@ class PEAGLEInference:
         return output_text, metrics
 
     def _generate_draft_parallel(self, input_ids, k):
-        """Generate K draft tokens using parallel MTP heads.
+        """Generate K draft tokens using parallel MTP heads in a SINGLE forward pass.
 
         ARCHITECTURE NOTE: P-EAGLE drafter predicts HIDDEN STATES, not tokens.
         The target model's lm_head converts these to target-vocab tokens.
@@ -130,41 +134,61 @@ class PEAGLEInference:
 
         For incompatible vocabularies, use a shared tokenizer (specified in feature
         extraction) and ensure both models can process those token IDs.
+
+        PARALLEL EXECUTION: This performs ONE forward pass on the drafter and
+        extracts all K predictions from the mtp_predictions list simultaneously.
         """
+        # Single forward pass on the drafter
+        outputs = self.drafter(input_ids, output_hidden_states=True)
+
         draft_tokens = []
-        current_ids = input_ids.clone()
+        last_logits = None
 
-        for i in range(k):
-            outputs = self.drafter(current_ids, output_hidden_states=True)
-            projected = outputs["projected_hidden"][:, -1:]
-
-            if i < len(outputs["mtp_predictions"]):
-                pred_hidden = outputs["mtp_predictions"][i][:, -1:]
-            else:
-                pred_hidden = projected
+        # Extract predictions from each MTP head in parallel
+        for i in range(min(k, len(outputs["mtp_predictions"]))):
+            # Get the last position's predicted hidden state from the i-th MTP head
+            pred_hidden = outputs["mtp_predictions"][i][:, -1:]
 
             # Convert predicted hidden state to logits using target's lm_head
-            # This matches training: we train to predict hidden states that,
-            # when passed through target's lm_head, produce correct tokens
             logits = self._hidden_to_logits(pred_hidden)
+            last_logits = logits
+
+            # Sample token from the predicted hidden state
             probs = F.softmax(logits[0, 0], dim=-1)
             token = torch.multinomial(probs, num_samples=1).item()
-
             draft_tokens.append(token)
-            current_ids = torch.cat([current_ids, torch.tensor([[token]], device=self.device)], dim=1])
 
-        return draft_tokens, logits
+        return draft_tokens, last_logits
 
     def _verify_parallel(self, input_ids, draft_tokens, temperature):
-        draft_tensor = torch.tensor([draft_tokens], device=self.device)
-        verification_input = torch.cat([input_ids, draft_tensor], dim=1)
+        """Verify draft tokens using tree attention for parallel verification.
 
-        outputs = self.target_model(verification_input)
+        Uses TreeAttentionMask to create tree-style attention inputs that allow
+        the target model to verify all K speculative tokens in a single forward pass.
+        """
+        draft_tensor = torch.tensor([draft_tokens], device=self.device)
+
+        # Create tree attention inputs using TreeAttentionMask
+        full_input_ids, attention_mask, position_ids = self.tree_attention.create_tree_inputs(
+            input_ids, draft_tensor
+        )
+
+        # Single parallel forward pass with tree attention
+        outputs = self.target_model(
+            input_ids=full_input_ids,
+            attention_mask=attention_mask,
+            position_ids=position_ids
+        )
+
         seq_len = input_ids.shape[1]
-        logits = outputs.logits[0, seq_len-1:seq_len+len(draft_tokens)-1]
+        num_draft = len(draft_tokens)
+
+        # Get logits for all speculative positions at once
+        # Position i in draft corresponds to logits at position seq_len + i - 1
+        logits = outputs.logits[0, seq_len-1:seq_len+num_draft-1]
 
         verified_tokens = []
-        for i in range(min(len(draft_tokens), logits.shape[0])):
+        for i in range(min(num_draft, logits.shape[0])):
             target_probs = F.softmax(logits[i] / temperature, dim=-1)
             target_token_prob = target_probs[draft_tokens[i]].item()
 
