@@ -57,7 +57,9 @@ class TreeAttentionMask:
             position_ids: [seq_len + num_speculative]
         """
         verified_pos = torch.arange(seq_len)
-        speculative_pos = torch.full((num_speculative,), seq_len - 1)
+        # Sequential position IDs for proper RoPE embedding support
+        # Speculative tokens start at seq_len, not seq_len - 1
+        speculative_pos = torch.arange(seq_len, seq_len + num_speculative)
         return torch.cat([verified_pos, speculative_pos])
 
     def create_tree_inputs(
