@@ -131,7 +131,17 @@ class FeatureExtractor:
         try:
             conversation_text = batch_item["conversation_text"]
             messages = batch_item["original_messages"]
-            segments = batch_item["segments"]
+
+            # Auto-generate segments from message roles if not provided
+            # Train on assistant responses (mask=1), ignore system/user (mask=0)
+            segments = batch_item.get("segments", [])
+            if not segments and messages:
+                segments = [
+                    {"index": i, "role": msg.get("role", "unknown"), "mask": 1 if msg.get("role") == "assistant" else 0}
+                    for i, msg in enumerate(messages)
+                ]
+                if segments:
+                    print(f"  Auto-generated segments: {sum(s['mask'] for s in segments)}/{len(segments)} assistant messages to train on")
 
             inputs = self.tokenizer(
                 conversation_text,

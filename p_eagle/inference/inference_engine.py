@@ -198,10 +198,7 @@ class PEAGLEInference:
         draft_tokens: List[int],
         temperature: float
     ) -> Tuple[int, List[int], Optional[torch.Tensor]]:
-        """Verify draft tokens using tree attention for parallel verification.
-
-        Uses TreeAttentionMask to create tree-style attention inputs that allow
-        the target model to verify all speculative tokens in a single forward pass.
+        """Verify draft tokens using parallel forward pass.
 
         VERIFICATION SAFETY: Uses greedy verification - only accepts a draft token
         if it matches the target model's argmax prediction. This ensures output
@@ -213,17 +210,11 @@ class PEAGLEInference:
             target_hidden: Last hidden state for injection loop
         """
         draft_tensor = torch.tensor([draft_tokens], device=self.device)
+        verification_input = torch.cat([input_ids, draft_tensor], dim=1)
 
-        # Create tree attention inputs using TreeAttentionMask
-        full_input_ids, attention_mask, position_ids = self.tree_attention.create_tree_inputs(
-            input_ids, draft_tensor
-        )
-
-        # Single parallel forward pass with tree attention
+        # Single forward pass - let model handle attention mask
         outputs = self.target_model(
-            input_ids=full_input_ids,
-            attention_mask=attention_mask,
-            position_ids=position_ids,
+            input_ids=verification_input,
             output_hidden_states=True
         )
 
@@ -246,12 +237,9 @@ class PEAGLEInference:
                 break
 
         # Extract hidden state at the last verified position for injection loop
-        # Get the last layer's hidden state at the final position of the verified sequence
         target_hidden = None
         if self.use_hidden_injection and hasattr(outputs, 'hidden_states'):
-            # hidden_states is a tuple of (num_layers,) tensors [batch, seq_len, hidden_dim]
-            last_layer_hidden = outputs.hidden_states[-1]  # [batch, seq_len + num_draft, hidden_dim]
-            # Take the hidden state at the last verified position
+            last_layer_hidden = outputs.hidden_states[-1]
             last_verified_pos = seq_len + len(verified_tokens) - 1
             target_hidden = last_layer_hidden[:, :last_verified_pos+1, :]
 

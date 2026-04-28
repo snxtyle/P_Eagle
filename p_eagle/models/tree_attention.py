@@ -82,16 +82,17 @@ class TreeAttentionMask:
         batch_size = input_ids.shape[0]
         seq_len = input_ids.shape[1]
         k = draft_tokens.shape[1]
+        device = input_ids.device
 
         # Concatenate inputs
         full_input_ids = torch.cat([input_ids, draft_tokens], dim=1)
 
-        # Create tree attention mask
-        mask = self.create_mask(seq_len, k)
+        # Create tree attention mask (on same device as input)
+        mask = self.create_mask(seq_len, k).to(device)
         attention_mask = mask.unsqueeze(0).expand(batch_size, -1, -1)
 
-        # Create position IDs
-        position_ids = self.create_position_ids(seq_len, k)
+        # Create position IDs (on same device as input)
+        position_ids = self.create_position_ids(seq_len, k).to(device)
         position_ids = position_ids.unsqueeze(0).expand(batch_size, -1)
 
         return full_input_ids, attention_mask, position_ids

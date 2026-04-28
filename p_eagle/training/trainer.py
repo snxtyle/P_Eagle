@@ -305,6 +305,7 @@ class EagleTrainer:
 
         # Setup scheduler
         total_steps = len(self.dataloader) * num_epochs
+        self.warmup_steps = warmup_steps  # Store for saving in history
         self.scheduler = get_cosine_schedule_with_warmup(
             self.optimizer,
             num_warmup_steps=warmup_steps,
@@ -334,8 +335,8 @@ class EagleTrainer:
         # Get vocab size from drafter (they should match for compatible models)
         vocab_size = len(self.tokenizer)
 
-        # Create lm_head with correct dimensions
-        lm_head = nn.Linear(target_hidden_dim, vocab_size, bias=False).to(self.device)
+        # Create lm_head with correct dimensions (bfloat16 to match drafter output)
+        lm_head = nn.Linear(target_hidden_dim, vocab_size, bias=False, dtype=torch.bfloat16).to(self.device)
 
         # Attempt to load actual lm_head weights from feature files
         loaded_weights = False
@@ -634,7 +635,7 @@ class EagleTrainer:
                     "num_epochs": self.num_epochs,
                     "batch_size": self.dataloader.batch_size,
                     "learning_rate": self.optimizer.defaults["lr"],
-                    "warmup_steps": self.scheduler.num_warmup_steps
+                    "warmup_steps": self.warmup_steps
                 }
             }, f, indent=2)
         print(f"\nTraining history saved to {history_path}")

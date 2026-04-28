@@ -32,16 +32,16 @@ echo "================================"
 # TARGET_MODEL="Qwen/Qwen2.5-7B-Instruct"
 # DRAFTER_MODEL="Qwen/Qwen2.5-1.5B-Instruct"
 
-# Option 3: Use existing config from previous run
-TARGET_MODEL="${TARGET_MODEL:-google/gemma-7b}"
-DRAFTER_MODEL="${DRAFTER_MODEL:-unsloth/gemma-2-2b}"
+# DGX Sparx Configuration: Gemma 7B (target) + Gemma 3 270M (drafter)
+TARGET_MODEL="google/gemma-7b-it"
+DRAFTER_MODEL="google/gemma-3-270m-it"
 
-# Auto-detect dimensions (or set manually)
-TARGET_HIDDEN_DIM="${TARGET_HIDDEN_DIM:-3072}"  # gemma-7b: 3072, qwen-7b: 3584, llama-7b: 4096
-DRAFTER_HIDDEN_DIM="${DRAFTER_HIDDEN_DIM:-2304}"  # gemma-2b: 2304, qwen-1.5b: 1536
+# Dimensions
+TARGET_HIDDEN_DIM="3072"   # gemma-7b: 3072
+DRAFTER_HIDDEN_DIM="2048"  # gemma-3-270m: 2048
 
 # Training parameters
-SPECULATION_DEPTH="${SPECULATION_DEPTH:-4}"
+SPECULATION_DEPTH="${SPECULATION_DEPTH:-6}"  # Increased from 4 - sequential position IDs make deeper heads accurate
 NUM_SAMPLES="${NUM_SAMPLES:-5000}"
 BATCH_SIZE="${BATCH_SIZE:-4}"
 EPOCHS="${EPOCHS:-50}"
@@ -306,14 +306,13 @@ if [ "$SKIP_TRAINING" = false ]; then
         --target_hidden_dim $TARGET_HIDDEN_DIM \
         --feature_dir $FEATURES_DIR \
         --output_dir $CHECKPOINT_DIR \
-        --epochs $EPOCHS \
+        --num_epochs $EPOCHS \
         --batch_size $BATCH_SIZE \
         --learning_rate $LEARNING_RATE \
         --warmup_steps 100 \
         --speculation_depth $SPECULATION_DEPTH \
         --use_lora \
         --lora_rank $LORA_RANK \
-        --save_every 500 \
         --skip-hardware-check"
 
     if [ "$RUN_DRY" = true ]; then
