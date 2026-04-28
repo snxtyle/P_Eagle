@@ -51,6 +51,10 @@ class EagleDataset(Dataset):
         loss_mask_segments = sample.get("loss_mask_segments", {})
         segments = loss_mask_segments.get("segments", [])
 
+        # Validate that at least one segment has mask=1 for training
+        if segments and not any(seg.get("mask") == 1 for seg in segments):
+            print(f"WARNING: Sample {idx} has no training segments (mask=1). Check your role strings!")
+
         return {
             "conversation_text": conversation_text,
             "segments": segments,
