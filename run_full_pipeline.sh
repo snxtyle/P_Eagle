@@ -53,7 +53,6 @@ SKIP_DATA_GEN=false
 SKIP_FEATURE_EXTRACTION=false
 SKIP_TRAINING=false
 SKIP_EVALUATION=false
-SKIP_COMPAT_CHECK=false
 RUN_DRY=false
 
 while [[ $# -gt 0 ]]; do
@@ -86,10 +85,6 @@ while [[ $# -gt 0 ]]; do
             SKIP_EVALUATION=true
             shift
             ;;
-        --skip-compat-check)
-            SKIP_COMPAT_CHECK=true
-            shift
-            ;;
         --dry-run)
             RUN_DRY=true
             shift
@@ -109,7 +104,6 @@ while [[ $# -gt 0 ]]; do
             echo "  --skip-feature-extraction Skip feature extraction"
             echo "  --skip-training           Skip training"
             echo "  --skip-evaluation         Skip evaluation"
-            echo "  --skip-compat-check       Skip compatibility check"
             echo "  --dry-run                 Show commands without executing"
             echo ""
             echo "Examples:"
@@ -155,36 +149,6 @@ echo "  LoRA Rank:      $LORA_RANK"
 if [ "$RUN_DRY" = true ]; then
     echo ""
     echo "*** DRY RUN MODE - Commands will be shown but not executed ***"
-fi
-
-# ============================================================================
-# STEP 0.5: Model Compatibility Check
-# ============================================================================
-if [ "$SKIP_COMPAT_CHECK" = false ]; then
-    echo ""
-    echo "Step 0.5: Model Compatibility Check"
-    echo "-----------------------------------"
-
-    if [ "$RUN_DRY" = false ]; then
-        python3 check_model_compatibility.py --target "$TARGET_MODEL" --drafter "$DRAFTER_MODEL" || {
-            echo ""
-            echo "WARNING: Model compatibility check failed!"
-            echo ""
-            echo "Options:"
-            echo "  1. Use models from the same family (e.g., both Gemma or both Qwen)"
-            echo "  2. Continue anyway (may produce gibberish output)"
-            echo "  3. Run with --skip-compat-check to skip this check"
-            echo ""
-            read -p "Continue anyway? [y/N] " -n 1 -r
-            echo
-            if [[ ! $REPLY =~ ^[Yy]$ ]]; then
-                echo "Aborted."
-                exit 1
-            fi
-        }
-    else
-        echo "Would run: python3 check_model_compatibility.py --target $TARGET_MODEL --drafter $DRAFTER_MODEL"
-    fi
 fi
 
 # ============================================================================

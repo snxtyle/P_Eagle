@@ -85,6 +85,7 @@ Extract tri-layer fused hidden states from the target model.
 ```bash
 python -m p_eagle.scripts.extract_features \
     --model_path google/gemma-7b \
+    --tokenizer_path google/gemma-2b \
     --input_data data/output/dataset.jsonl \
     --output_dir data/features \
     --quantization 8bit \
@@ -98,6 +99,7 @@ python -m p_eagle.scripts.extract_features \
 | Argument | Description | Default |
 |----------|-------------|---------|
 | `--model_path` | Target model (Gemma, Llama, Qwen, etc.) | required |
+| `--tokenizer_path` | Tokenizer to use (use drafter model for compatibility) | same as model_path |
 | `--input_data` | Path to dataset JSONL file | required |
 | `--output_dir` | Where to save .pt feature files | `./features` |
 | `--quantization` | Quantization mode: `4bit`, `8bit`, `none` | `4bit` |
@@ -111,6 +113,30 @@ python -m p_eagle.scripts.extract_features \
 - `fused_hidden_states`: Tri-layer features (shape: `[batch, seq, hidden_dim]`)
 - `loss_mask`: Binary mask (1=train on this token, 0=ignore)
 - `attention_mask`: Padding mask
+- `texts`: Original text for flexible retokenization
+
+**Dataset Format:**
+Input JSONL should have:
+```json
+{
+  "messages": [
+    {"role": "system", "content": "..."},
+    {"role": "user", "content": "..."},
+    {"role": "assistant", "content": "..."}
+  ],
+  "loss_mask_segments": {
+    "train_indices": [2],
+    "ignore_indices": [0, 1],
+    "segments": [
+      {"index": 0, "role": "system", "mask": 0},
+      {"index": 1, "role": "user", "mask": 0},
+      {"index": 2, "role": "assistant", "mask": 1}
+    ]
+  }
+}
+```
+
+**Note:** Content can be plain string or nested format: `[{"type": "text", "text": "..."}]`
 
 ---
 
@@ -372,6 +398,26 @@ p_eagle/
 
 ---
 
+## Recent Fixes (May 2026)
+
+### Critical Fix: loss_mask_segments
+**Problem:** Dataset generation was missing `loss_mask_segments`, causing training loss to be 0 and MAL to stay at 1.0.  
+**Fix:** Updated `generate_data.py` to output proper `loss_mask_segments` with assistant masks.
+
+### Content Format Parsing
+**Problem:** Nested content like `[{"type": "text", "text": "..."}]` wasn't being parsed, causing empty assistant messages.  
+**Fix:** Enhanced `_parse_content` in `feature_extractor.py` to handle nested JSON formats.
+
+### "I'll"/"I will" Filter Removed
+**Problem:** Dataset generation filtered out assistant responses starting with "I'll" or "I will", removing valid responses.  
+**Fix:** Removed this filter from `generate_data.py`.
+
+### Training/Inference Alignment
+**Problem:** Hidden state injection mode could mismatch between training and inference.  
+**Fix:** Both now use `use_hidden_injection=False` by default for consistency.
+
+---
+
 ## Troubleshooting
 
 ### Common Issues
@@ -381,6 +427,10 @@ p_eagle/
 
 **Issue:** `Repository not found` for HuggingFace model  
 **Solution:** Check model name spelling, ensure HF_TOKEN is set for gated models
+
+**Issue:** `MAL = 1.0` after training (no learning)  
+**Cause:** Empty `loss_mask_segments` in dataset  
+**Solution:** Regenerate dataset with updated `generate_data.py`, verify mask sum > 0 in features
 
 **Issue:** `MAL < 2.0` after training  
 **Solution:** Train longer (more epochs), increase dataset size, or check feature extraction is from correct target model

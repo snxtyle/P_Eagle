@@ -96,11 +96,68 @@ Since GLM-5.1 and GLM-1.5B share the same vocabulary:
 
 3. **Inference**: GLM-1.5B hidden → GLM-5.1 lm_head → GLM tokens ✓
 
+## Multi-Token Prediction (MTP) Heads
+
+The drafter uses K parallel MTP heads to predict future hidden states:
+
+```
+projected_hidden ──┬─→ MTP Head 1 ──→ h_{t+2}
+                   ├─→ MTP Head 2 ──→ h_{t+3}
+                   ├─→ MTP Head 3 ──→ h_{t+4}
+                   └─→ MTP Head K ──→ h_{t+K+1}
+```
+
+Each MTP head is a 2-layer MLP:
+```python
+EagleMTPHead(
+    hidden_dim=target_hidden_dim,
+    target_hidden_dim=target_hidden_dim,
+    num_layers=2,  # Linear → LayerNorm → GELU → Dropout → Linear
+    dtype=torch.bfloat16
+)
+```
+
+**Training:** Each head k is trained to predict the hidden state at position t+k+1 from position t.
+**Inference:** All K heads run in parallel in a single forward pass.
+
+## Loss Mask Segments
+
+Training uses segment-based loss masks to identify which tokens to train on:
+
+```json
+{
+  "loss_mask_segments": {
+    "train_indices": [2],      // Assistant message indices
+    "ignore_indices": [0, 1],  // System/user indices
+    "segments": [
+      {"index": 0, "role": "system", "mask": 0},
+      {"index": 1, "role": "user", "mask": 0},
+      {"index": 2, "role": "assistant", "mask": 1}
+    ]
+  }
+}
+```
+
+- `mask=1`: Train on these tokens (assistant responses)
+- `mask=0`: Ignore these tokens (system, user, tool)
+
+**Critical:** If `loss_mask_segments` is missing or empty, training loss will be 0 and MAL will be 1.0 (no learning).
+
+## Content Format Handling
+
+The feature extractor handles multiple content formats:
+- Plain string: `"Hello world"`
+- Nested list: `[{"type": "text", "text": "Hello"}]`
+- String-encoded list: `"[{'type': 'text', 'text': 'Hello'}]"`
+
+All formats are normalized to strings for tokenization.
+
 ## Implementation Status
 
 ✅ Fixed: Token-level loss during training (KL divergence)
 ✅ Fixed: Token alignment with target's lm_head
 ✅ Fixed: Vocab compatibility checking
-⚠️  Note: Target lm_head is created as placeholder during training
-   - In production, load actual target model's lm_head weights
-   - Or train with target model accessible (slower but more accurate)
+✅ Fixed: Content parsing for nested formats
+✅ Fixed: loss_mask_segments generation in dataset
+✅ Fixed: Training/inference hidden injection alignment (disabled by default)
+⚠️  Note: Target lm_head is loaded from feature files during training if available

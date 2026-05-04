@@ -87,6 +87,10 @@ class FeatureExtractor:
         if self.tokenizer.pad_token is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
 
+        # Check vocabulary compatibility if using different models
+        if tokenizer_name and tokenizer_name != model_name:
+            self._check_vocab_compatibility(model_name, tokenizer_to_use)
+
         self.model = AutoModelForCausalLM.from_pretrained(
             model_name,
             quantization_config=self.quant_config if quantization != "none" else None,
@@ -112,6 +116,46 @@ class FeatureExtractor:
         elif mode == "8bit":
             return BitsAndBytesConfig(load_in_8bit=True)
         return None
+
+    def _check_vocab_compatibility(self, target_model: str, drafter_model: str):
+        """Check if target and drafter have compatible vocabularies."""
+        print("\n" + "="*60)
+        print("Checking vocabulary compatibility...")
+        print(f"  Target:  {target_model}")
+        print(f"  Drafter: {drafter_model}")
+
+        try:
+            tok_target = AutoTokenizer.from_pretrained(target_model, token=HF_TOKEN)
+            tok_drafter = AutoTokenizer.from_pretrained(drafter_model, token=HF_TOKEN)
+
+            vocab_target = len(tok_target)
+            vocab_drafter = len(tok_drafter)
+
+            print(f"\n  Target vocab size:  {vocab_target}")
+            print(f"  Drafter vocab size: {vocab_drafter}")
+
+            # Test encoding with sample texts
+            test_texts = ["Hello world", "The quick brown fox", "Payment processing"]
+            mismatches = 0
+
+            for text in test_texts:
+                enc_target = tok_target.encode(text, add_special_tokens=False)
+                enc_drafter = tok_drafter.encode(text, add_special_tokens=False)
+                if enc_target != enc_drafter:
+                    mismatches += 1
+
+            if mismatches == 0:
+                print(f"  Tokenization: IDENTICAL (all {len(test_texts)} test strings match)")
+                print("="*60)
+            else:
+                print(f"  WARNING: {mismatches}/{len(test_texts)} test strings differ!")
+                print("  Models may produce gibberish output due to vocab mismatch.")
+                print("  Recommendation: Use models from the same family (e.g., both Gemma).")
+                print("="*60)
+
+        except Exception as e:
+            print(f"  Could not check compatibility: {e}")
+            print("="*60)
 
     @torch.no_grad()
     def extract_sample(self, samples):
