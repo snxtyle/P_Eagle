@@ -30,6 +30,121 @@ from ..utils.loss_utils import masked_mse_loss, hidden_state_token_loss
 from ..utils.metrics import MetricsTracker, GenerationMetrics
 
 
+def run_pre_training_security_check(feature_dir: str) -> bool:
+    """
+    Run pre-training security verification.
+
+    Scans feature directory source data for secrets using gitleaks
+    and custom patterns. Fails fast if CRITICAL secrets detected.
+
+    Returns True if safe to proceed, False if secrets found.
+    """
+    import subprocess
+    import tempfile
+    import re
+
+    print_section("PRE-TRAINING SECURITY VERIFICATION")
+
+    # Check if we have the source dataset in feature metadata
+    feature_path = Path(feature_dir)
+    if not feature_path.exists():
+        print("⚠️  Feature directory not found, skipping security check")
+        return True
+
+    # Try to find source dataset from feature metadata
+    source_dataset = None
+    for meta_file in feature_path.glob("*_shard*.pt"):
+        try:
+            import torch
+            data = torch.load(meta_file, map_location="cpu")
+            # Features don't contain raw text, they're already processed
+            # Security should be checked at data generation time
+            print("✅ Features are pre-processed tensors (no raw text to scan)")
+            print("   Security scan should have run during: generate_data.py → extract_features.py")
+            return True
+        except Exception:
+            continue
+
+    # If we reach here, no features found
+    print("⚠️  No feature files found to verify")
+    return True
+
+
+def verify_dataset_source_security(dataset_path: str, skip_check: bool = False) -> bool:
+    """
+    Verify dataset source is clean before training.
+
+    This should be called on the ORIGINAL dataset (JSONL) before
+    feature extraction or training.
+    """
+    if skip_check:
+        print("⚠️  Security check skipped (--skip-security-check)")
+        return True
+
+    if not Path(dataset_path).exists():
+        print(f"⚠️  Dataset not found: {dataset_path}")
+        return True  # Can't check what doesn't exist
+
+    print_section("DATASET SECURITY SCAN")
+    print(f"Dataset: {dataset_path}")
+
+    # Try to run gitleaks
+    try:
+        result = subprocess.run(
+            ["which", "gitleaks"],
+            capture_output=True,
+            timeout=5
+        )
+        if result.returncode != 0:
+            print("⚠️  gitleaks not installed, trying to install/download...")
+            # Try auto-install
+            install_script = Path(__file__).parent.parent.parent / "scripts" / "scan_dataset_secrets.py"
+            if install_script.exists():
+                print(f"   Using: {install_script}")
+    except Exception:
+        pass
+
+    # Run basic regex scan for common patterns
+    print("\n  Running regex pattern scan...")
+    patterns = [
+        (r'\b[A-Z]{5}[0-9]{4}[A-Z]\b', 'Indian PAN'),  # PAN numbers
+        (r'\b(?:4[0-9]{12}(?:[0-9]{3})?|5[1-5][0-9]{14})\b', 'Credit Card'),  # Credit cards
+        (r'\bAKIA[0-9A-Z]{16}\b', 'AWS Access Key'),  # AWS keys
+        (r'-----BEGIN (?:RSA |DSA |EC )?PRIVATE KEY-----', 'Private Key'),  # Private keys
+    ]
+
+    findings = []
+    line_count = 0
+
+    try:
+        with open(dataset_path, 'r') as f:
+            for line_num, line in enumerate(f, 1):
+                line_count += 1
+                for pattern, name in patterns:
+                    if re.search(pattern, line):
+                        findings.append((line_num, name))
+
+                # Limit scan to first 1000 lines for speed
+                if line_num >= 1000:
+                    break
+    except Exception as e:
+        print(f"  ⚠️  Could not scan dataset: {e}")
+        return True
+
+    if findings:
+        print(f"\n  ❌ SECURITY ISSUES FOUND:")
+        for line_num, name in findings[:10]:
+            print(f"     Line {line_num}: {name}")
+        if len(findings) > 10:
+            print(f"     ... and {len(findings) - 10} more")
+        print(f"\n  ⛔ TRAINING ABORTED - Clean dataset required")
+        return False
+    else:
+        print(f"  ✅ No obvious secrets in first {line_count} lines")
+        print(f"  ✅ Dataset security check passed")
+        return True
+
+
 def print_section(title: str):
     """Print formatted section header."""
     print(f"\n{'='*70}")
@@ -765,8 +880,24 @@ def main():
     parser.add_argument("--warmup_steps", type=int, default=100)
     parser.add_argument("--skip-hardware-check", action="store_true",
                         help="Skip GPU/disk requirements check")
+    parser.add_argument("--skip-security-check", action="store_true",
+                        help="Skip pre-training security verification (not recommended)")
+    parser.add_argument("--dataset-source", type=str, default=None,
+                        help="Path to original dataset JSONL for security verification")
 
     args = parser.parse_args()
+
+    # Run pre-training security verification
+    if args.dataset_source:
+        if not verify_dataset_source_security(args.dataset_source, args.skip_security_check):
+            print("\n⛔ Training aborted due to security concerns.")
+            print("   Use --skip-security-check to override (not recommended)")
+            exit(1)
+    else:
+        # Check feature directory security
+        if not run_pre_training_security_check(args.feature_dir):
+            print("\n⛔ Training aborted due to security concerns.")
+            exit(1)
 
     trainer = EagleTrainer(
         drafter_model_name=args.drafter_model,

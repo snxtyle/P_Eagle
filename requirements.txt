@@ -35,10 +35,15 @@ jsonlines>=3.1.0
 pyyaml>=6.0.0
 python-dotenv>=1.0.0
 
-# Secret Scanning (Optional)
-detect-secrets>=1.4.0
-presidio-analyzer>=2.2.0
-gitpython>=3.1.0
+# Secret Scanning & Security (Required for pre-training verification)
+detect-secrets>=1.4.0           # Yelp's secret detection library
+gitpython>=3.1.0                # Git repository analysis
+requests>=2.31.0                # For downloading security tools
+
+# Note: External tools required for full security scanning:
+#   gitleaks: Install via `wget https://github.com/zricethezav/gitleaks/releases/latest/download/gitleaks_$(uname)_$(uname -m).tar.gz`
+#   trufflehog: Install via `pip install trufflehog`
+# These are automatically downloaded by scripts/scan_dataset_secrets.py if not present
 
 # System Monitoring (Optional)
 psutil>=5.9.0
