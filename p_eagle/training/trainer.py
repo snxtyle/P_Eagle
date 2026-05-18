@@ -12,11 +12,13 @@ import logging
 import os
 import re
 import shutil
+import signal
 import sys
 import time
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Any
 from datetime import timedelta, datetime
+from contextlib import contextmanager
 
 import torch
 import torch.nn as nn
@@ -28,6 +30,147 @@ from transformers import get_cosine_schedule_with_warmup, AutoTokenizer
 from bitsandbytes.optim import PagedAdamW8bit
 from tqdm import tqdm
 import numpy as np
+
+
+class _BrokenPipeSuppressor:
+    """Context manager to suppress BrokenPipeError and handle SIGPIPE.
+
+    This prevents training crashes when stdout/stderr is piped to
+    programs like `head` that close the pipe early.
+    """
+    def __init__(self):
+        self._old_sigpipe_handler = None
+        self._old_stdout = None
+        self._old_stderr = None
+
+    def __enter__(self):
+        # Save old signal handler
+        self._old_sigpipe_handler = signal.signal(signal.SIGPIPE, signal.SIG_DFL)
+        # Save file objects
+        self._old_stdout = sys.stdout
+        self._old_stderr = sys.stderr
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        # Restore signal handler
+        signal.signal(signal.SIGPIPE, self._old_sigpipe_handler)
+        # Restore file objects
+        sys.stdout = self._old_stdout
+        sys.stderr = self._old_stderr
+        return False  # Don't suppress exceptions
+
+
+def _tqdm_safe_write(pbar, *args, **kwargs):
+    """Safely update tqdm progress bar, handling BrokenPipeError."""
+    try:
+        pbar.update(*args, **kwargs)
+    except (BrokenPipeError, OSError) as e:
+        # Pipe was closed - stop updating but don't crash
+        pbar.disable = True
+        # Optionally log that progress output stopped
+        try:
+            print(f"\n[Progress output stopped: {type(e).__name__}]", file=sys.stderr)
+        except:
+            pass
+
+
+@contextmanager
+def safe_tqdm(*args, **kwargs):
+    """Create a tqdm progress bar that handles broken pipes gracefully.
+
+    Usage:
+        with safe_tqdm(total=100, desc="Training") as pbar:
+            for i in range(100):
+                # do work
+                pbar.update(1)
+    """
+    # Set default values for file and dynamic_ncols to handle piping
+    kwargs.setdefault('file', sys.stdout)
+    kwargs.setdefault('dynamic_ncols', True)
+    kwargs.setdefault('mininterval', 0.5)  # Reduce update frequency
+
+    pbar = None
+    try:
+        pbar = tqdm(*args, **kwargs)
+        yield _SafePbarWrapper(pbar)
+    except (BrokenPipeError, OSError) as e:
+        # Pipe was closed - clean up gracefully
+        if pbar is not None:
+            try:
+                pbar.disable = True
+            except:
+                pass
+        # Re-raise with a cleaner message only if not already handling
+        if not isinstance(e, BrokenPipeError):
+            raise
+    finally:
+        if pbar is not None:
+            try:
+                pbar.close()
+            except:
+                pass
+
+
+class _SafePbarWrapper:
+    """Wrapper around tqdm that safely handles broken pipes."""
+
+    def __init__(self, pbar):
+        self._pbar = pbar
+
+    def update(self, n=1):
+        try:
+            self._pbar.update(n)
+        except (BrokenPipeError, OSError):
+            self._pbar.disable = True
+
+    def set_postfix(self, *args, **kwargs):
+        try:
+            self._pbar.set_postfix(*args, **kwargs)
+        except (BrokenPipeError, OSError):
+            pass
+
+    def set_description(self, *args, **kwargs):
+        try:
+            self._pbar.set_description(*args, **kwargs)
+        except (BrokenPipeError, OSError):
+            pass
+
+    def __getattr__(self, name):
+        return getattr(self._pbar, name)
+
+
+class _DummyPbarWrapper:
+    """Dummy progress bar that does nothing.
+
+    Used when stdout is closed/redirected (e.g., piped to head).
+    This allows training to continue without progress display.
+    """
+
+    def __init__(self):
+        self.n = 0
+        self.disable = False
+
+    def update(self, n=1):
+        self.n += n
+
+    def set_postfix(self, *args, **kwargs):
+        pass
+
+    def set_description(self, *args, **kwargs):
+        pass
+
+    def write(self, *args, **kwargs):
+        pass
+
+    def close(self):
+        pass
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        pass
+
 
 from p_eagle.models.peagle_drafter import EagleDrafterModel
 from p_eagle.utils.feature_utils import EagleTrainingDataset
@@ -1342,7 +1485,21 @@ class EagleTrainer:
             if self.is_main_process:
                 self.logger.info(f"Creating tqdm progress bar for {len(self.train_loader)} batches...")
 
-            pbar = tqdm(self.train_loader, desc=f"Epoch {epoch + 1}")
+            # Create tqdm with safe settings to handle broken pipes
+            # Create progress bar with safe settings (handles broken pipes gracefully)
+            try:
+                pbar = tqdm(
+                    self.train_loader,
+                    desc=f"Epoch {epoch + 1}",
+                    file=sys.stdout,
+                    dynamic_ncols=True,
+                    mininterval=0.5,
+                    maxinterval=2.0
+                )
+            except (BrokenPipeError, OSError) as e:
+                # Pipe already closed - use a dummy progress bar
+                self.logger.warning(f"Cannot create progress bar ({type(e).__name__}). Continuing without progress display...")
+                pbar = _DummyPbarWrapper()
 
             # Periodic memory check interval (check 10 times per epoch)
             memory_check_interval = max(1, len(self.train_loader) // 10)
@@ -1478,8 +1635,15 @@ class EagleTrainer:
                 mask_cov = avg_metrics.get('avg_mask_coverage', 1.0)
                 if mask_cov < 0.5:
                     postfix_dict["mask"] = f"{mask_cov:.0%}"
-                pbar.set_postfix(postfix_dict)
-                pbar.update(valid_accum_steps)
+                # Safely update progress bar (handles broken pipe gracefully)
+                try:
+                    pbar.set_postfix(postfix_dict)
+                    pbar.update(valid_accum_steps)
+                except (BrokenPipeError, OSError):
+                    # Pipe closed - disable progress bar and continue training
+                    pbar.disable = True
+                    if self.is_main_process:
+                        self.logger.warning("Progress bar output stopped (pipe closed). Continuing training...")
 
                 # Log to TensorBoard
                 if self.global_step % 10 == 0:
