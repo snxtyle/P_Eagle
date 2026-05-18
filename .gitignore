@@ -1,29 +1,72 @@
 # Environment
 .env
+.env.local
+.env.*.local
 
-# Data directories
-data/raw/
-data/processed/
-data/features/
-data/output/
-venv/
-checkpoints/
-models_cache/
-checkpoints_peagle
-reference.md
-__pycache__
-# Output directory
-output/*
-# Example files
-/example.json
-logs/*
 # Python
 __pycache__/
 *.py[cod]
 *$py.class
 *.so
 .Python
+*.egg
+*.egg-info/
+dist/
+build/
+
+# Virtual Environment
+venv/
+.venv/
+env/
+.env/
+
+# Data directories (large, generated)
+data/
+checkpoints/
+checkpoints_peagle
+models_cache/
+output/
+
+# Logs
+logs/
+*.log
+
+# Plots and outputs
+plot_scripts/plots/
+*.png
+*.jpg
+*.pdf
+
+# Temporary files
+*.tmp
+*.temp
+*.swp
+*.swo
+*~
+.DS_Store
+
+# IDE
+.vscode/
+.idea/
+*.iml
 
 # Claude
-.claude
-.vscode
+.claude/
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Jupyter Notebooks
+*.ipynb
+
+# Weights & Biases
+wandb/
+
+# Example files
+/example.json
+reference.md

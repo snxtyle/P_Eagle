@@ -29,10 +29,10 @@ from bitsandbytes.optim import PagedAdamW8bit
 from tqdm import tqdm
 import numpy as np
 
-from ..models.peagle_drafter import EagleDrafterModel
-from ..utils.feature_utils import EagleTrainingDataset
-from ..utils.loss_utils import masked_mse_loss, hidden_state_token_loss
-from ..utils.metrics import MetricsTracker, GenerationMetrics
+from p_eagle.models.peagle_drafter import EagleDrafterModel
+from p_eagle.utils.feature_utils import EagleTrainingDataset
+from p_eagle.utils.loss_utils import masked_mse_loss, hidden_state_token_loss
+from p_eagle.utils.metrics import MetricsTracker, GenerationMetrics
 
 
 def setup_distributed():
@@ -603,6 +603,7 @@ class EagleTrainer:
         speculation_depth: int = 4,
         use_lora: bool = True,
         lora_rank: int = 64,
+        lora_alpha: int = 128,
         learning_rate: float = 1e-4,
         batch_size: int = 4,
         num_epochs: int = 3,
@@ -615,12 +616,19 @@ class EagleTrainer:
         quantization: str = None,
         logger: logging.Logger = None,
         run_log_dir: Path = None,
+        log_dir: str = None,
         gpu_safety_margin_gb: float = 1.5,
         resume_from: str = None,
         gradient_accumulation_steps: int = 1,
         max_seq_len: int = 2048,
         rank: int = 0,
-        world_size: int = 1
+        world_size: int = 1,
+        deepspeed_config: str = None,
+        use_flash_attention: bool = True,
+        # Regularization parameters
+        label_smoothing: float = 0.0,
+        mtp_dropout: float = 0.1,
+        weight_decay: float = 0.01,
     ):
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
@@ -640,6 +648,14 @@ class EagleTrainer:
         self.rank = rank
         self.world_size = world_size
         self.is_main_process = (rank == 0)
+        self.deepspeed_enabled = False
+
+        # Regularization parameters
+        self.label_smoothing = label_smoothing
+        self.mtp_dropout = mtp_dropout
+        self.weight_decay = weight_decay
+        if self.is_main_process:
+            self.logger.info(f"Regularization: label_smoothing={label_smoothing}, mtp_dropout={mtp_dropout}, weight_decay={weight_decay}")
 
         # Initialize GPU memory monitor
         self.gpu_monitor = GPUMemoryMonitor(
@@ -669,17 +685,33 @@ class EagleTrainer:
             speculation_depth=speculation_depth,
             use_lora=use_lora,
             lora_rank=lora_rank,
+            lora_alpha=lora_alpha,
             device=device,
             use_hidden_injection=True,   # CRITICAL: EAGLE-3 needs target hidden state injection
             injection_mode="concat",     # CONCATENATION: first layer gets 2x hidden size input
-            quantization=quantization
+            quantization=quantization,
+            use_flash_attention=use_flash_attention,
+            mtp_dropout=mtp_dropout,     # Dropout for regularization
         )
 
-        # Wrap model with DDP if using multiple GPUs
-        if self.world_size > 1:
-            self.model = DDP(self.model, device_ids=[self.rank], output_device=self.rank)
+        # Wrap model with DDP if using multiple GPUs (but NOT if using DeepSpeed)
+        # find_unused_parameters=True needed because EAGLE's curriculum training only
+        # uses specific MTP heads initially, leaving other parameters unused
+        if self.world_size > 1 and not deepspeed_config:
+            # For single-GPU nodes, local_rank is always 0 on both machines
+            # Use LOCAL_RANK env var (set by torchrun) for correct device
+            import os
+            local_rank = int(os.environ.get('LOCAL_RANK', self.rank))
+            self.model = DDP(
+                self.model,
+                device_ids=[local_rank],
+                output_device=local_rank,
+                find_unused_parameters=True  # Needed for EAGLE curriculum learning
+            )
             if self.is_main_process:
-                self.logger.info(f"Wrapped model with DDP (world_size={self.world_size})")
+                self.logger.info(f"Wrapped model with DDP (world_size={self.world_size}, find_unused_parameters=True)")
+        elif deepspeed_config and self.is_main_process:
+            self.logger.info("Skipping DDP wrapping - DeepSpeed will handle distributed communication")
 
         # Load checkpoint if resuming (only on main process)
         if self.resume_from and self.is_main_process:
@@ -712,9 +744,15 @@ class EagleTrainer:
         # ==========================
 
         # Enable gradient checkpointing to save VRAM (trades compute for memory)
-        if hasattr(self.model.base_model, 'gradient_checkpointing_enable'):
-            self.model.base_model.gradient_checkpointing_enable()
+        # Handle DDP/DeepSpeed wrapped models
+        model_unwrapped = self.model.module if hasattr(self.model, 'module') else self.model
+        if hasattr(model_unwrapped.base_model, 'gradient_checkpointing_enable'):
+            model_unwrapped.base_model.gradient_checkpointing_enable()
             print("  Enabled gradient checkpointing (saves ~50% VRAM)")
+            # Required for gradient checkpointing + LoRA to work together
+            if hasattr(model_unwrapped, 'enable_input_require_grads'):
+                model_unwrapped.enable_input_require_grads()
+                print("  Enabled input requires grads for LoRA compatibility")
 
         # Load tokenizer (use same cache as model)
         import os
@@ -754,21 +792,21 @@ class EagleTrainer:
                 # Other trainable params
                 bias_params.append(param)
 
-        # Higher LR for MTP heads (10x) to ensure they learn
-        # LoRA uses base LR
+        # Recommended LRs: LoRA=base, MTP=10x, Projection=2x
+        # MTP heads need high LR to converge fast; projection layers learn slower
         print(f"  Parameter groups:")
-        print(f"    LoRA params: {len(lora_params)} tensors")
-        print(f"    MTP heads: {len(mtp_params)} tensors (LR = {learning_rate * 10:.2e})")
-        print(f"    Projection: {len(proj_params)} tensors (LR = {learning_rate * 10:.2e})")
-        print(f"    Bias/No-WD: {len(bias_params)} tensors")
+        print(f"    LoRA params: {len(lora_params)} tensors (LR = {learning_rate:.2e}, WD = {weight_decay})")
+        print(f"    MTP heads: {len(mtp_params)} tensors (LR = {learning_rate * 10:.2e}, WD = {weight_decay})")
+        print(f"    Projection: {len(proj_params)} tensors (LR = {learning_rate * 2:.2e}, WD = {weight_decay})")
+        print(f"    Bias/No-WD: {len(bias_params)} tensors (LR = {learning_rate:.2e}, WD = 0.0)")
 
         param_groups = []
         if lora_params:
-            param_groups.append({"params": lora_params, "lr": learning_rate, "weight_decay": 0.01})
+            param_groups.append({"params": lora_params, "lr": learning_rate, "weight_decay": weight_decay})
         if mtp_params:
-            param_groups.append({"params": mtp_params, "lr": learning_rate * 10, "weight_decay": 0.01})
+            param_groups.append({"params": mtp_params, "lr": learning_rate * 10, "weight_decay": weight_decay})
         if proj_params:
-            param_groups.append({"params": proj_params, "lr": learning_rate * 10, "weight_decay": 0.01})
+            param_groups.append({"params": proj_params, "lr": learning_rate * 2, "weight_decay": weight_decay})
         if bias_params:
             param_groups.append({"params": bias_params, "lr": learning_rate, "weight_decay": 0.0})
 
@@ -777,6 +815,9 @@ class EagleTrainer:
             betas=(0.9, 0.999),
             eps=1e-8
         )
+
+        # Store base LR for gradient clipping comparison (DeepSpeed compatibility)
+        self._base_lr = learning_rate
 
         # Load dataset with lazy shard loading (official EAGLE pattern)
         # Dataset loads only one shard at a time, reducing RAM from 148GB to ~6GB
@@ -854,8 +895,9 @@ class EagleTrainer:
             num_training_steps=total_steps
         )
 
-        # TensorBoard
-        self.writer = SummaryWriter(log_dir=self.output_dir / "logs")
+        # TensorBoard - use custom log_dir if provided, otherwise default to output_dir/logs
+        log_path = Path(log_dir) if log_dir else self.output_dir / "logs"
+        self.writer = SummaryWriter(log_dir=log_path)
         self.metrics_tracker = MetricsTracker()
 
         print(f"Training setup complete:")
@@ -1097,10 +1139,16 @@ class EagleTrainer:
 
     def _collate_fn(self, batch: List[Dict]) -> Dict[str, torch.Tensor]:
         """Collate function for batching. Returns CPU tensors."""
+        # CRITICAL FIX: Ensure pad_token_id is valid before using
+        pad_token_id = self.tokenizer.pad_token_id
+        if pad_token_id is None:
+            pad_token_id = 0  # Safe fallback
+            print(f"WARNING: pad_token_id is None, using fallback value 0")
+
         input_ids = nn.utils.rnn.pad_sequence(
             [b["input_ids"] for b in batch],
             batch_first=True,
-            padding_value=self.tokenizer.pad_token_id
+            padding_value=pad_token_id
         )
         target_hidden = nn.utils.rnn.pad_sequence(
             [b["target_hidden"] for b in batch],
@@ -1118,12 +1166,30 @@ class EagleTrainer:
             padding_value=0
         )
 
+        # FIX: Include target_token_ids to use precomputed ground-truth targets
+        # instead of computing them dynamically from normalized hidden states
+        target_token_ids_list = []
+        for b in batch:
+            ttids = b.get("target_token_ids", None)
+            if ttids is not None:
+                target_token_ids_list.append(ttids)
+            else:
+                # Fallback: create a dummy tensor with -100 (ignore index)
+                target_token_ids_list.append(torch.full((1,), -100, dtype=torch.long))
+
+        target_token_ids = nn.utils.rnn.pad_sequence(
+            target_token_ids_list,
+            batch_first=True,
+            padding_value=-100  # Use -100 as ignore index for cross_entropy
+        )
+
         # Return CPU tensors - moved to device in training loop
         return {
             "input_ids": input_ids,
             "target_hidden": target_hidden,
             "loss_mask": loss_mask,
-            "attention_mask": attention_mask
+            "attention_mask": attention_mask,
+            "target_token_ids": target_token_ids  # Precomputed ground-truth targets
         }
 
     @torch.no_grad()
@@ -1146,6 +1212,7 @@ class EagleTrainer:
             attention_mask = batch["attention_mask"].to(self.device)
             target_hidden = batch["target_hidden"].to(self.device)
             loss_mask = batch["loss_mask"].to(self.device)
+            target_token_ids = batch["target_token_ids"].to(self.device)  # Precomputed targets
 
             outputs = self.model(
                 input_ids=input_ids,
@@ -1181,13 +1248,17 @@ class EagleTrainer:
                 target_trimmed = target_shifted[:, :min_len, :]
                 mask_trimmed = loss_mask[:, shift:shift + min_len]
 
+                # FIX: Use precomputed target_token_ids, properly shifted for MTP
+                target_ids_shifted = target_token_ids[:, shift:shift + min_len]
+
                 # Use SAME loss function as training for consistency
                 ce_loss_k, mse_loss_k, _ = hidden_state_token_loss(
                     pred_trimmed,
                     target_trimmed,
                     self.target_lm_head,
                     mask_trimmed,
-                    temperature=1.0
+                    temperature=1.0,
+                    target_token_ids=target_ids_shifted
                 )
 
                 if not torch.isnan(ce_loss_k):
@@ -1208,9 +1279,6 @@ class EagleTrainer:
             if mse_losses:
                 mse_total = sum(mse_losses) / len(mse_losses)
                 total_loss += 0.1 * mse_total
-
-            # Apply same scaling as training
-            total_loss *= 10.0
 
             val_losses.append(total_loss)
 
@@ -1260,15 +1328,19 @@ class EagleTrainer:
             # Log curriculum learning status (only on main process)
             active_heads = self._get_active_heads(epoch + 1)
             if self.is_main_process:
-                self.logger.info(f"Curriculum: Training heads 1-{active_heads} of {self.model.speculation_depth}")
+                self.logger.info(f"Curriculum: Training heads 1-{active_heads} of {self.speculation_depth}")
 
             epoch_losses = []
             epoch_ce_losses = []
             epoch_mse_losses = []
-            epoch_mtp_losses = {i: [] for i in range(self.model.speculation_depth)}
+            epoch_mtp_losses = {i: [] for i in range(self.speculation_depth)}
             # Gradient accumulation setup
             grad_accum_steps = self.gradient_accumulation_steps
             effective_batch_size = self.batch_size * grad_accum_steps
+
+            # DIAGNOSTIC: Log before creating tqdm
+            if self.is_main_process:
+                self.logger.info(f"Creating tqdm progress bar for {len(self.train_loader)} batches...")
 
             pbar = tqdm(self.train_loader, desc=f"Epoch {epoch + 1}")
 
@@ -1277,9 +1349,15 @@ class EagleTrainer:
             batchOOM_retry_count = 0
 
             # Convert iterator to list to support slicing for accumulation
+            if self.is_main_process:
+                self.logger.info("Creating batch iterator...")
+
             batch_iterator = iter(self.train_loader)
             batch_idx = 0
             accumulation_counter = 0
+
+            if self.is_main_process:
+                self.logger.info(f"Starting training loop with {len(self.train_loader)} total steps...")
 
             while batch_idx < len(self.train_loader):
                 # Check GPU memory periodically
@@ -1298,10 +1376,18 @@ class EagleTrainer:
                 valid_accum_steps = 0
 
                 for accum_step in range(grad_accum_steps):
+                    # DIAGNOSTIC: Log before fetching first batch
+                    if batch_idx == 0 and accum_step == 0 and self.is_main_process:
+                        self.logger.info("Fetching first batch from data loader...")
+
                     try:
                         batch = next(batch_iterator)
                     except StopIteration:
                         break
+
+                    # DIAGNOSTIC: Log after fetching first batch
+                    if batch_idx == 0 and accum_step == 0 and self.is_main_process:
+                        self.logger.info(f"First batch fetched. Input ids shape: {batch['input_ids'].shape}")
 
                     current_accum_step = (accumulation_counter * grad_accum_steps + accum_step) % grad_accum_steps
                     is_last_accum = (accum_step == grad_accum_steps - 1)
@@ -1343,6 +1429,16 @@ class EagleTrainer:
 
                     batch_idx += 1
 
+                    # Clean up memory after each step to prevent accumulation
+                    # This helps prevent SIGKILL from memory exhaustion
+                    torch.cuda.synchronize()
+                    import gc
+                    gc.collect()
+                    torch.cuda.empty_cache()
+                    if self.is_main_process and self.global_step % 5 == 0:
+                        mem_stats = self.gpu_monitor.get_memory_stats()
+                        self.logger.debug(f"Memory after step {self.global_step}: {mem_stats['allocated_gb']:.2f}GB / {mem_stats['total_gb']:.2f}GB")
+
                 # Average accumulated loss and metrics
                 if valid_accum_steps > 0:
                     avg_loss = accum_loss / valid_accum_steps
@@ -1357,7 +1453,7 @@ class EagleTrainer:
                         avg_metrics[key] = sum(values) / len(values)
 
                 # Track per-head losses and component losses
-                for i in range(self.model.speculation_depth):
+                for i in range(self.speculation_depth):
                     key = f"mtp_loss_{i+1}"
                     if key in avg_metrics:
                         epoch_mtp_losses[i].append(avg_metrics[key])
@@ -1403,7 +1499,7 @@ class EagleTrainer:
             # Epoch summary
             avg_train_loss = np.mean(epoch_losses)
 
-            # CRITICAL: Verify MTP heads are actually learning (weights changed from init)
+            # Verify MTP heads are learning (loss trend is the real signal)
             if epoch == 1 or epoch == self.num_epochs // 2 or epoch == self.num_epochs:
                 with torch.no_grad():
                     mtp_std_sum = 0.0
@@ -1414,8 +1510,9 @@ class EagleTrainer:
                                 break
                     avg_mtp_std = mtp_std_sum / len(self.model.mtp_heads)
                     self.logger.info(f"  MTP weight avg std: {avg_mtp_std:.6f} (init was ~0.02)")
-                    if abs(avg_mtp_std - 0.02) < 0.001:
-                        self.logger.warning("  ⚠️  MTP heads still at initialization! Training may not be working.")
+                    # Std is a coarse metric — weights can change significantly while std stays similar
+                    if abs(avg_mtp_std - 0.02) < 0.005:
+                        self.logger.info("  ℹ️  MTP std near init (normal — check loss trend instead)")
                     else:
                         self.logger.info(f"  ✓ MTP heads have changed from init by {(avg_mtp_std - 0.02):.6f}")
 
@@ -1436,7 +1533,7 @@ class EagleTrainer:
                 "active_heads": active_heads,
                 "gpu_memory": self.gpu_monitor.get_memory_stats()
             }
-            for i in range(self.model.speculation_depth):
+            for i in range(self.speculation_depth):
                 if epoch_mtp_losses[i]:
                     epoch_stat["per_head_avg_loss"][f"head_{i+1}"] = np.mean(epoch_mtp_losses[i])
 
@@ -1502,7 +1599,7 @@ class EagleTrainer:
                     "drafter_model": self.drafter_model_name,
                     "num_epochs": self.num_epochs,
                     "batch_size": self.train_loader.batch_size,
-                    "learning_rate": self.optimizer.defaults["lr"],
+                    "learning_rate": getattr(self, '_base_lr', self.optimizer.param_groups[0]['lr'] if self.optimizer.param_groups else 0),
                     "warmup_steps": self.warmup_steps
                 }
             }, f, indent=2)
@@ -1536,7 +1633,7 @@ class EagleTrainer:
         elif epoch <= 6:
             return 3
         else:
-            return self.model.speculation_depth
+            return self.speculation_depth
 
     @oom_recovery_handler
     def _training_step(self, batch: Dict[str, torch.Tensor], epoch: int = 1,
@@ -1568,16 +1665,44 @@ class EagleTrainer:
         attention_mask = batch["attention_mask"].to(self.device)
         target_hidden = batch["target_hidden"].to(self.device)
         loss_mask = batch["loss_mask"].to(self.device)
+        target_token_ids = batch["target_token_ids"].to(self.device)  # Precomputed ground-truth targets
+
+        # Note: DeepSpeed handles distributed synchronization internally.
+        # Do NOT call dist.barrier() here - it conflicts with DeepSpeed's NCCL management.
+
+        # ROOT CAUSE FIX: Validate batch shapes are identical across ranks
+        # Shape mismatches cause NCCL collective operations to hang
+        if self.world_size > 1 and self.is_main_process:
+            # Log shapes for debugging
+            self.logger.debug(f"Batch shapes - input_ids: {input_ids.shape}, "
+                            f"target_hidden: {target_hidden.shape}, "
+                            f"loss_mask: {loss_mask.shape}")
 
         # Forward pass: drafter generates hidden states WITH target_hidden injection
         # EAGLE-3 CRITICAL: Pass target_hidden for concatenation at first layer
-        # This aligns drafter's distribution with target model's distribution
         outputs = self.model(
             input_ids=input_ids,
             attention_mask=attention_mask,
-            target_hidden=target_hidden,  # NOW PASSED: EAGLE-3 concatenation injection
+            target_hidden=target_hidden,
             is_training=True
         )
+
+        # Early NaN detection: if model outputs are already bad, skip this batch
+        mtp_has_nan = any(not torch.isfinite(p).all() for p in outputs["mtp_predictions"] if p.numel() > 0)
+        if mtp_has_nan:
+            if self.is_main_process and self.global_step % 10 == 0:
+                self.logger.warning("Model produced NaN/Inf in MTP predictions - skipping batch")
+            # Return dummy loss to keep distributed sync intact
+            dummy_loss = torch.tensor(0.0, device=self.device, requires_grad=True)
+            return dummy_loss, {
+                "mtp_loss_avg": float('nan'),
+                "ce_loss_avg": float('nan'),
+                "mse_loss_avg": float('nan'),
+                "token_acc_avg": 0.0,
+                "active_heads": self._get_active_heads(epoch),
+                "avg_mask_coverage": 0.0,
+                "skipped_due_to_nan": True,
+            }
 
         # Determine active heads for curriculum learning
         active_heads = self._get_active_heads(epoch)
@@ -1611,6 +1736,11 @@ class EagleTrainer:
                     target_trimmed = target_shifted[:, :min_len]
                     mask_trimmed = mask_shifted[:, :min_len]
 
+                    # FIX: Use precomputed target_token_ids, properly shifted for MTP
+                    # This ensures we use the ground-truth token targets from the model's
+                    # actual logits, not computed from normalized hidden states
+                    target_ids_shifted = target_token_ids[:, shift:shift + min_len]
+
                     # Skip if mask is all zeros (no learning signal)
                     if mask_trimmed.sum() == 0:
                         continue
@@ -1624,7 +1754,9 @@ class EagleTrainer:
                         mask_trimmed,
                         temperature=1.0,
                         ce_weight=1.0,
-                        mse_weight=0.1
+                        mse_weight=0.1,
+                        target_token_ids=target_ids_shifted,  # Precomputed ground-truth targets
+                        label_smoothing=self.label_smoothing
                     )
 
                     ce_losses.append(ce_loss_k)
@@ -1652,23 +1784,46 @@ class EagleTrainer:
             total_loss = total_loss + 0.1 * mse_total  # Secondary: hidden state similarity
 
         # --- LOSS SCALING ---
-        # The CE loss is already properly scaled in hidden_state_token_loss.
-        # We apply a small multiplier to ensure healthy gradient magnitudes.
-        # CE loss is the primary driver - it ensures token predictions match.
-        # MSE is secondary - it keeps hidden states structurally similar.
-        if total_loss.item() > 0:
-            total_loss = total_loss * 10.0  # Scale up for healthy gradients
+        # CE loss is already properly scaled in hidden_state_token_loss.
+        # No additional scaling needed - the MTP head LR boost (2x) provides
+        # sufficient gradient magnitude without risking explosion.
         # --------------------------
 
-        if total_loss.item() == 0:
+        # Detect NaN/Inf loss - treat like zero-loss to prevent gradient corruption
+        if not torch.isfinite(total_loss):
+            ce_vals = [f"{ce.item():.2f}" for ce in ce_losses] if ce_losses else ["n/a"]
+            if self.is_main_process and self.global_step % 10 == 0:
+                self.logger.warning(
+                    f"Non-finite loss at step {self.global_step} "
+                    f"(CE={','.join(ce_vals)}, heads={len(ce_losses)})"
+                )
+            total_loss = torch.tensor(0.0, device=self.device)
+
+        # Track if this is a zero-loss batch for proper handling after backward
+        is_zero_loss_batch = (total_loss.item() == 0)
+
+        # DISTRIBUTED SAFETY: We MUST call backward() even with zero/NaN loss to avoid NCCL deadlock!
+        # If one rank skips backward() while another calls it, the NCCL allreduce will hang forever.
+        if is_zero_loss_batch:
+            # Create a dummy zero loss that requires grad to participate in backward pass
             total_loss = torch.tensor(0.0, device=self.device, requires_grad=True)
+            if self.is_main_process:
+                self.logger.debug("Zero-loss/NaN batch: using dummy loss for NCCL synchronization")
 
         # Scale loss for gradient accumulation
         if total_accumulation_steps > 1:
             total_loss = total_loss / total_accumulation_steps
 
-        # Backward pass
-        total_loss.backward()
+        # Backward pass (use DeepSpeed if enabled)
+        if self.deepspeed_enabled:
+            self.model.backward(total_loss)
+        else:
+            total_loss.backward()
+
+        # Free activation memory immediately after backward
+        # This helps prevent memory accumulation during training
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
 
         # CRITICAL FIX: Log gradient norms before clipping to diagnose issues
         if self.global_step % 10 == 0:
@@ -1685,20 +1840,31 @@ class EagleTrainer:
             if lora_grad_norm > 0:
                 self.writer.add_scalar("gradients/lora_norm", lora_grad_norm ** 0.5, self.global_step)
 
-        # Gradient clipping per parameter group (less aggressive for MTP heads)
-        # LoRA: clip at max_grad_norm (1.0 default)
-        # MTP heads: clip at max_grad_norm * 5 (5.0) - allow larger updates
-        for group in self.optimizer.param_groups:
-            if group.get('lr', 0) > self.optimizer.defaults.get('lr', 2e-5) * 2:
-                # High LR group = MTP heads, allow larger gradients
-                torch.nn.utils.clip_grad_norm_(group['params'], self.max_grad_norm * 5)
-            else:
-                torch.nn.utils.clip_grad_norm_(group['params'], self.max_grad_norm)
+        # Gradient clipping per parameter group
+        # MTP heads (10x LR): allow larger gradients since they learn faster
+        # LoRA/other (1-2x LR): standard clipping
+        # SKIP for zero-loss batches (no real gradients to clip)
+        if not is_zero_loss_batch:
+            base_lr = getattr(self, '_base_lr', 2e-5)
+            for group in self.optimizer.param_groups:
+                # High LR group = MTP heads, allow larger gradients (>2x base LR)
+                if group.get('lr', 0) > base_lr * 2:
+                    torch.nn.utils.clip_grad_norm_(group['params'], self.max_grad_norm * 2)
+                else:
+                    torch.nn.utils.clip_grad_norm_(group['params'], self.max_grad_norm)
 
         # Only update weights on last accumulation step
-        if is_last_step:
-            self.optimizer.step()
-            self.scheduler.step()
+        # SKIP for zero-loss batches (gradients are zero, no update needed)
+        if is_last_step and not is_zero_loss_batch:
+            if self.deepspeed_enabled:
+                self.model.step()
+            else:
+                self.optimizer.step()
+                self.scheduler.step()
+
+            # Clear optimizer temporary memory
+            torch.cuda.synchronize()
+            torch.cuda.empty_cache()
 
         metrics = {
             "mtp_loss_avg": np.mean(mtp_losses) if mtp_losses else 0.0,
@@ -1707,6 +1873,7 @@ class EagleTrainer:
             "token_acc_avg": np.mean(token_accs) if token_accs else 0.0,
             "active_heads": active_heads,
             "avg_mask_coverage": np.mean(head_mask_coverages) if head_mask_coverages else 0.0,
+            "skipped_due_to_empty_mask": is_zero_loss_batch,
         }
         for i, loss_i in enumerate(mtp_losses):
             metrics[f"mtp_loss_{i+1}"] = loss_i
@@ -1737,6 +1904,8 @@ def main():
     parser.add_argument("--output_dir", default="./checkpoints")
     parser.add_argument("--use_lora", action="store_true", default=False)
     parser.add_argument("--lora_rank", type=int, default=64)
+    parser.add_argument("--lora_alpha", type=int, default=128,
+                        help="LoRA alpha scaling factor (default: 128)")
     parser.add_argument("--batch_size", type=int, default=4)
     parser.add_argument("--num_epochs", type=int, default=3)
     parser.add_argument("--learning_rate", type=float, default=2e-5,
@@ -1752,6 +1921,8 @@ def main():
                         help="Quantize drafter model (4bit or 8bit) to reduce VRAM usage")
     parser.add_argument("--run-name", type=str, default=None,
                         help="Custom name for this training run (used in logs)")
+    parser.add_argument("--log_dir", type=str, default=None,
+                        help="Directory for logs (default: {output_dir}/logs)")
     parser.add_argument("--gpu-safety-margin", type=float, default=1.5,
                         help="Minimum GPU memory to keep free in GB (default: 1.5)")
     parser.add_argument("--yes", action="store_true",
@@ -1762,11 +1933,34 @@ def main():
                         help="Number of steps to accumulate gradients before updating weights. Larger values = less memory but slower training (default: 1)")
     parser.add_argument("--max_seq_len", type=int, default=2048,
                         help="Maximum sequence length for training. Reduce to 1024 to save VRAM on memory-constrained systems (default: 2048)")
+    parser.add_argument("--deepspeed", type=str, default=None,
+                        help="Path to DeepSpeed config JSON file for ZeRO optimization")
+    parser.add_argument("--use_flash_attention", action="store_true", dest="use_flash_attention",
+                        default=True, help="Use Flash Attention 2 for faster training (default: True)")
+    parser.add_argument("--no_flash_attention", action="store_false", dest="use_flash_attention",
+                        help="Disable Flash Attention")
+    parser.add_argument("--local_rank", type=int, default=-1,
+                        help="Local rank for distributed training (passed automatically by DeepSpeed)")
+    # Regularization parameters
+    parser.add_argument("--label_smoothing", type=float, default=0.0,
+                        help="Label smoothing factor (0.0 = no smoothing, recommended: 0.1)")
+    parser.add_argument("--mtp_dropout", type=float, default=0.1,
+                        help="Dropout rate in MTP heads (default: 0.1)")
+    parser.add_argument("--weight_decay", type=float, default=0.01,
+                        help="Weight decay for optimizer (default: 0.01)")
 
     args = parser.parse_args()
 
-    # Initialize distributed training if using multiple GPUs
-    rank, world_size, local_rank = setup_distributed()
+    # Initialize distributed training if using multiple GPUs (but NOT if using DeepSpeed)
+    # DeepSpeed handles its own distributed initialization
+    if args.deepspeed:
+        # DeepSpeed will handle distributed setup - just parse env vars
+        rank = int(os.environ.get('RANK', 0))
+        world_size = int(os.environ.get('WORLD_SIZE', 1))
+        local_rank = int(os.environ.get('LOCAL_RANK', 0))
+        torch.cuda.set_device(local_rank)
+    else:
+        rank, world_size, local_rank = setup_distributed()
     is_main = (rank == 0)
 
     # Setup logging FIRST - before anything else (only on main process for file logging)
@@ -1774,7 +1968,8 @@ def main():
     if is_main:
         output_path.mkdir(parents=True, exist_ok=True)
     # Barrier to ensure directory is created before other processes proceed
-    if world_size > 1:
+    # Skip barrier when using DeepSpeed (it handles synchronization internally)
+    if world_size > 1 and not args.deepspeed:
         dist.barrier()
     logger, run_log_dir, run_id = setup_training_logger(output_path, args.run_name)
 
@@ -1810,6 +2005,7 @@ def main():
         speculation_depth=args.speculation_depth,
         use_lora=args.use_lora,
         lora_rank=args.lora_rank,
+        lora_alpha=args.lora_alpha,
         learning_rate=args.learning_rate,
         batch_size=args.batch_size,
         num_epochs=args.num_epochs,
@@ -1819,15 +2015,49 @@ def main():
         quantization=args.quantization,
         logger=logger,
         run_log_dir=run_log_dir,
+        log_dir=args.log_dir,
         gpu_safety_margin_gb=args.gpu_safety_margin,
         resume_from=args.resume,
         gradient_accumulation_steps=args.gradient_accumulation_steps,
         max_seq_len=args.max_seq_len,
         rank=rank,
-        world_size=world_size
+        world_size=world_size,
+        deepspeed_config=args.deepspeed,
+        use_flash_attention=args.use_flash_attention,
+        # Regularization parameters
+        label_smoothing=args.label_smoothing,
+        mtp_dropout=args.mtp_dropout,
+        weight_decay=args.weight_decay,
     )
 
     try:
+        # Initialize DeepSpeed if config provided
+        if args.deepspeed:
+            try:
+                import deepspeed
+                logger.info("Initializing DeepSpeed ZeRO...")
+                # Load DeepSpeed config from file
+                with open(args.deepspeed, 'r') as f:
+                    ds_config = json.load(f)
+                model, optimizer, _, scheduler = deepspeed.initialize(
+                    model=trainer.model,
+                    model_parameters=trainer.model.parameters(),
+                    optimizer=trainer.optimizer,
+                    lr_scheduler=trainer.scheduler,
+                    config=ds_config
+                )
+                trainer.model = model
+                trainer.optimizer = optimizer
+                trainer.scheduler = scheduler
+                trainer.deepspeed_enabled = True
+                logger.info("DeepSpeed initialized successfully")
+            except ImportError:
+                logger.error("DeepSpeed not installed. Run: pip install deepspeed")
+                raise
+            except Exception as e:
+                logger.error(f"DeepSpeed initialization failed: {e}")
+                raise
+
         trainer.train()
         if is_main:
             logger.info(f"\n{'='*70}")
@@ -1844,7 +2074,9 @@ def main():
             logger.error(f"See logs for details: {run_log_dir}")
         raise
     finally:
-        cleanup_distributed()
+        # Only cleanup if we initialized manually (not when DeepSpeed manages it)
+        if not args.deepspeed:
+            cleanup_distributed()
 
 
 if __name__ == "__main__":

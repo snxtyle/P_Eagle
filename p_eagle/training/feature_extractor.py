@@ -42,20 +42,29 @@ class TriLayerConfig:
                                f"Available attrs: {dir(model.config)}")
         self.mode = mode
 
-        if mode == "early,middle,final":
+        if mode == "last":
+            # Use the last transformer layer output directly (matches lm_head training)
+            # hidden_states tuple: [0]=embeddings, [1]=layer0, ..., [-1]=last_layer
+            self.layer_indices = [-1]
+            print(f"Feature extraction mode: LAST LAYER (index -1, layer {self.num_layers - 1})")
+            print("  This matches the lm_head training distribution.")
+        elif mode == "early,middle,final":
             self.layer_indices = [
                 self.num_layers // 4,
                 self.num_layers // 2,
                 3 * self.num_layers // 4
             ]
+            print(f"Tri-Layer Config: extracting from layers {self.layer_indices} (MEAN fusion)")
+            print("  WARNING: Fused features may not align with lm_head!")
         elif mode == "first,middle,last":
             self.layer_indices = [0, self.num_layers // 2, self.num_layers - 1]
+            print(f"Tri-Layer Config: extracting from layers {self.layer_indices}")
         elif mode == "all":
             self.layer_indices = list(range(self.num_layers))
+            print(f"Feature extraction: ALL layers {self.layer_indices}")
         else:
             self.layer_indices = [int(x) for x in mode.split(",")]
-
-        print(f"Tri-Layer Config: extracting from layers {self.layer_indices}")
+            print(f"Feature extraction: custom layers {self.layer_indices}")
 
 
 class FeatureExtractor:
@@ -67,7 +76,7 @@ class FeatureExtractor:
         output_dir: str,
         tokenizer_name: str = None,
         quantization: str = "8bit",
-        layer_config: str = "early,middle,final",
+        layer_config: str = "early,middle,final",  # Tri-layer extraction
         fusion_mode: str = "mean",
         max_length: int = 4096,  # Increased for H200 141GB VRAM
         batch_size: int = 1,
@@ -360,17 +369,41 @@ class FeatureExtractor:
             print(f"  Got hidden states")
 
             all_hidden_states = outputs.hidden_states
-            fusion_result = fuse_tri_layer_features(
-                all_hidden_states,
-                self.layer_config.layer_indices,
-                self.fusion_mode
-            )
 
-            # Extract fused hidden states and normalization stats
-            fused_hidden = fusion_result['fused']
-            raw_hidden = fusion_result['raw']
-            mean_stats = fusion_result['mean']
-            std_stats = fusion_result['std']
+            # CRITICAL FIX: Save actual target token IDs from model's own logits.
+            # These are the ground-truth next-token predictions that the lm_head
+            # produces from the LAST layer. We save them explicitly so training
+            # uses correct targets regardless of which layer(s) we extract for
+            # hidden-state MSE loss.
+            target_token_ids = outputs.logits.argmax(dim=-1)  # [batch, seq_len]
+
+            if self.layer_config.mode == "last":
+                # Use last layer hidden state directly (guaranteed lm_head compatible)
+                last_hidden = all_hidden_states[-1]  # [batch, seq, hidden_dim]
+
+                # Apply final norm so hidden states are lm_head-ready
+                # (the model's lm_head expects normed input, not raw layer output)
+                if hasattr(self.model, 'model') and hasattr(self.model.model, 'norm'):
+                    normed = self.model.model.norm(last_hidden)
+                elif hasattr(self.model, 'norm'):
+                    normed = self.model.norm(last_hidden)
+                else:
+                    normed = last_hidden
+
+                fused_hidden = normed[0]
+                raw_hidden = normed[0]
+                mean_stats = None
+                std_stats = None
+            else:
+                fusion_result = fuse_tri_layer_features(
+                    all_hidden_states,
+                    self.layer_config.layer_indices,
+                    self.fusion_mode
+                )
+                fused_hidden = fusion_result['fused']
+                raw_hidden = fusion_result['raw']
+                mean_stats = fusion_result['mean']
+                std_stats = fusion_result['std']
 
             token_level_mask = align_segments_to_tokens(
                 messages,
@@ -389,12 +422,13 @@ class FeatureExtractor:
             return {
                 "text": conversation_text,  # Store for flexible retokenization
                 "input_ids": input_ids[0].cpu(),
-                "fused_hidden_states": fused_hidden[0].cpu(),
-                "raw_hidden_states": raw_hidden[0].cpu(),
+                "fused_hidden_states": fused_hidden.cpu(),  # [seq, hidden_dim] - FIXED: removed [0]
+                "raw_hidden_states": raw_hidden.cpu(),      # [seq, hidden_dim] - FIXED: removed [0]
                 "norm_mean": mean_stats[0].cpu() if mean_stats is not None else None,
                 "norm_std": std_stats[0].cpu() if std_stats is not None else None,
                 "loss_mask": token_level_mask.cpu(),
-                "attention_mask": attention_mask[0].cpu()
+                "attention_mask": attention_mask[0].cpu(),
+                "target_token_ids": target_token_ids[0].cpu()  # Actual next-token preds from model logits
             }
 
         except Exception as e:
@@ -463,6 +497,9 @@ class FeatureExtractor:
 
             all_hidden_states = outputs.hidden_states
 
+            # CRITICAL FIX: Save actual target token IDs from model's own logits
+            target_token_ids = outputs.logits.argmax(dim=-1)  # [batch, seq_len]
+
             # Process each sample in the batch
             results = []
             for i in range(len(batch_items)):
@@ -473,17 +510,22 @@ class FeatureExtractor:
                 sample_input_ids = input_ids[i, :valid_len]
                 sample_attention = attention_mask[i, :valid_len]
 
-                # Fuse hidden states for this sample
-                fusion_result = fuse_tri_layer_features(
-                    [hs[i:i+1, :valid_len, :] for hs in all_hidden_states],
-                    self.layer_config.layer_indices,
-                    self.fusion_mode
-                )
-
-                fused_hidden = fusion_result['fused']
-                raw_hidden = fusion_result['raw']
-                mean_stats = fusion_result['mean']
-                std_stats = fusion_result['std']
+                if self.layer_config.mode == "last":
+                    last_hidden = all_hidden_states[-1]
+                    fused_hidden = last_hidden[i:i+1, :valid_len, :]
+                    raw_hidden = last_hidden[i:i+1, :valid_len, :]
+                    mean_stats = None
+                    std_stats = None
+                else:
+                    fusion_result = fuse_tri_layer_features(
+                        [hs[i:i+1, :valid_len, :] for hs in all_hidden_states],
+                        self.layer_config.layer_indices,
+                        self.fusion_mode
+                    )
+                    fused_hidden = fusion_result['fused']
+                    raw_hidden = fusion_result['raw']
+                    mean_stats = fusion_result['mean']
+                    std_stats = fusion_result['std']
 
                 # Align segments
                 token_level_mask = align_segments_to_tokens(
@@ -501,7 +543,8 @@ class FeatureExtractor:
                     "norm_mean": mean_stats[0].cpu() if mean_stats is not None else None,
                     "norm_std": std_stats[0].cpu() if std_stats is not None else None,
                     "loss_mask": token_level_mask.cpu(),
-                    "attention_mask": sample_attention.cpu()
+                    "attention_mask": sample_attention.cpu(),
+                    "target_token_ids": target_token_ids[i, :valid_len].cpu()
                 })
 
             return results
@@ -548,17 +591,18 @@ class FeatureExtractor:
             batch_first=True,
             padding_value=self.tokenizer.pad_token_id
         )
+        # Convert to bf16 to reduce shard size by ~50%
         hidden_states = torch.nn.utils.rnn.pad_sequence(
             [f["fused_hidden_states"] for f in features],
             batch_first=True,
             padding_value=0.0
-        )
+        ).to(torch.bfloat16)
         # Save raw hidden states for lm_head compatibility
         raw_hidden_states = torch.nn.utils.rnn.pad_sequence(
             [f["raw_hidden_states"] for f in features],
             batch_first=True,
             padding_value=0.0
-        )
+        ).to(torch.bfloat16)
         # Save normalization statistics for denormalization
         norm_means = None
         norm_stds = None
@@ -583,6 +627,15 @@ class FeatureExtractor:
             batch_first=True,
             padding_value=0
         )
+        # CRITICAL FIX: Save actual target token IDs from model's own logits.
+        # These are precomputed next-token predictions (argmax of outputs.logits).
+        # Using them for CE loss ensures training targets are correct regardless
+        # of which layer(s) we extract for hidden-state MSE loss.
+        target_token_ids = torch.nn.utils.rnn.pad_sequence(
+            [f["target_token_ids"] for f in features],
+            batch_first=True,
+            padding_value=-100
+        )
 
         # Extract text for flexible retokenization with any drafter
         texts = [f["text"] for f in features]
@@ -604,6 +657,7 @@ class FeatureExtractor:
             "raw_hidden_states": raw_hidden_states,
             "loss_mask": loss_masks,
             "attention_mask": attention_masks,
+            "target_token_ids": target_token_ids,
             "model_name": self.model_name,
             "layer_indices": self.layer_config.layer_indices,
             "fusion_mode": self.fusion_mode,
@@ -630,12 +684,15 @@ def main():
     parser.add_argument("--input_data", required=True)
     parser.add_argument("--output_dir", default="./features")
     parser.add_argument("--quantization", default="8bit", choices=["4bit", "8bit", "none"])
-    parser.add_argument("--layers", default="early,middle,final")
-    parser.add_argument("--fusion", default="mean", choices=["mean", "weighted", "concat"])
-    parser.add_argument("--max_length", type=int, default=4096,
-                        help="Max sequence length (default: 4096 for H200 141GB VRAM)")
+    parser.add_argument("--layers", default="early,middle,final",
+                        help="Which layers to extract: 'early,middle,final' (default), 'last', 'first,middle,last', or comma-separated indices")
+    parser.add_argument("--fusion", default="mean", choices=["mean", "weighted", "concat", "none"],
+                        help="How to fuse multiple layers: 'mean' (default), 'weighted', 'concat', 'none'")
+    parser.add_argument("--max_length", type=int, default=2048,
+                        help="Max sequence length (default: 2048)")
     parser.add_argument("--batch_size", type=int, default=1)
-    parser.add_argument("--shard_size", type=int, default=1000)
+    parser.add_argument("--shard_size", type=int, default=50,
+                        help="Samples per shard (default: 50 for ~2GB shards)")
 
     args = parser.parse_args()
 

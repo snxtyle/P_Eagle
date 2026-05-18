@@ -196,23 +196,66 @@ class EagleTrainingDataset(Dataset):
         self.shard_sample_counts = []  # Number of samples per shard
 
         print(f"Indexing {len(self.shard_files)} feature shards...")
+        # For large shards, use lazy indexing: only collect sample counts,
+        # defer loss_mask filtering to __getitem__ to avoid OOM during init
+        import os
+        total_filtered = 0
+
         for shard_idx, pt_file in enumerate(self.shard_files):
-            # Only load metadata (num_samples), not full data
-            data = torch.load(pt_file, map_location="cpu", weights_only=False)
-            num_samples = data["num_samples"]
-            self.shard_sample_counts.append(num_samples)
+            shard_size_gb = os.path.getsize(pt_file) / 1e9
 
-            # Add index entries for this shard
-            for local_idx in range(num_samples):
-                self.sample_index.append((shard_idx, local_idx))
+            # For large shards (>10GB), skip expensive filtering during init
+            # Filtering will be done on-the-fly during __getitem__
+            if shard_size_gb > 10:
+                print(f"  Shard {shard_idx+1}/{len(self.shard_files)}: {shard_size_gb:.1f}GB (large - using lazy loading)")
+                # Estimate sample count from file size (~30 samples per GB typical for bf16 features)
+                est_samples = int(shard_size_gb * 30)
+                self.shard_sample_counts.append(est_samples)
+                # Add all estimated indices (filtering deferred to __getitem__)
+                for local_idx in range(est_samples):
+                    self.sample_index.append((shard_idx, local_idx))
+            else:
+                # Small shards: can afford to load and filter
+                try:
+                    data = torch.load(pt_file, map_location="cpu", weights_only=True)
+                    num_samples = data["num_samples"]
+                    loss_masks = data["loss_mask"]
 
-            # Free memory immediately
-            del data
-            import gc
-            gc.collect()  # Force garbage collection to free RAM
+                    valid_indices = []
+                    for local_idx in range(num_samples):
+                        loss_mask = loss_masks[local_idx]
+                        is_valid = False
+                        if isinstance(loss_mask, torch.Tensor):
+                            is_valid = loss_mask.sum() > 0
+                        elif isinstance(loss_mask, (list, tuple)):
+                            is_valid = sum(loss_mask) > 0
+                        else:
+                            is_valid = True
 
-        print(f"Indexed {len(self.sample_index)} total samples across {len(self.shard_files)} shards")
-        print(f"RAM usage: ~{self.shard_sample_counts[0] * 6 / 1024:.1f}GB per shard (vs {sum(self.shard_sample_counts) * 6 / 1024:.1f}GB if loading all)")
+                        if is_valid:
+                            valid_indices.append(local_idx)
+                        else:
+                            total_filtered += 1
+
+                    self.shard_sample_counts.append(len(valid_indices))
+                    for local_idx in valid_indices:
+                        self.sample_index.append((shard_idx, local_idx))
+
+                    del data
+                    import gc
+                    gc.collect()
+                except Exception as e:
+                    print(f"  Warning: Could not filter shard {pt_file.name}: {e}")
+                    # Fallback: assume all samples valid
+                    est_samples = int(shard_size_gb * 600)
+                    self.shard_sample_counts.append(est_samples)
+                    for local_idx in range(est_samples):
+                        self.sample_index.append((shard_idx, local_idx))
+
+        print(f"Indexed {len(self.sample_index)} samples across {len(self.shard_files)} shards")
+        if total_filtered > 0:
+            print(f"  (Filtered {total_filtered} samples from small shards)")
+        print(f"Note: Large shards use lazy loading - some zero-loss samples may be included")
 
         # Shard cache: only keep recent shards in memory
         self._shard_cache = {}  # shard_idx -> shard_data
@@ -267,9 +310,31 @@ class EagleTrainingDataset(Dataset):
         if "raw_hidden_states" in shard_data:
             sample["raw_hidden_states"] = shard_data["raw_hidden_states"][local_idx]
 
+        # Add precomputed target token IDs (actual model logits argmax) if available
+        if "target_token_ids" in shard_data:
+            sample["target_token_ids"] = shard_data["target_token_ids"][local_idx]
+
         # STEP 1: INTELLIGENT WINDOW SELECTION on ORIGINAL features
         loss_mask_full = sample["loss_mask"]
         seq_len = len(loss_mask_full)
+
+        # FIX for buggy 2D features (missing sequence dimension)
+        # Check raw_hidden_states first, fallback to fused_hidden_states
+        if "raw_hidden_states" in sample:
+            raw_hidden = sample["raw_hidden_states"]
+        else:
+            raw_hidden = sample["fused_hidden_states"]
+
+        # If raw_hidden is 1D [hidden_dim], reshape to 2D [seq_len, hidden_dim]
+        # The sequence length comes from input_ids (stored in sample), hidden dim is the tensor's size
+        if raw_hidden.dim() == 1:
+            actual_seq_len = len(sample["input_ids"])
+            hidden_dim = raw_hidden.shape[0]
+            raw_hidden = raw_hidden.unsqueeze(0).expand(actual_seq_len, hidden_dim)
+            if "raw_hidden_states" in sample:
+                sample["raw_hidden_states"] = raw_hidden
+            else:
+                sample["fused_hidden_states"] = raw_hidden
 
         if seq_len > self.max_seq_len:
             # Find the best window that maximizes mask coverage
@@ -307,7 +372,7 @@ class EagleTrainingDataset(Dataset):
                 target_hidden = sample["fused_hidden_states"]
 
         # STEP 2: Truncate/pad to exact max_seq_len
-        target_len = min(len(target_hidden), self.max_seq_len)
+        target_len = min(target_hidden.shape[0], self.max_seq_len)
 
         # Use target's tokenization (already aligned with hidden states)
         # Skip retokenization to maintain alignment with windowed data
@@ -316,11 +381,17 @@ class EagleTrainingDataset(Dataset):
         loss_mask_sliced = loss_mask[:target_len]
         target_hidden = target_hidden[:target_len]
 
+        # Slice target token IDs if available (must stay aligned with hidden states)
+        target_token_ids = sample.get("target_token_ids", None)
+        if target_token_ids is not None:
+            target_token_ids = target_token_ids[:target_len]
+
         return {
             "input_ids": input_ids,
             "attention_mask": attention_mask,
             "target_hidden": target_hidden,
-            "loss_mask": loss_mask_sliced
+            "loss_mask": loss_mask_sliced,
+            "target_token_ids": target_token_ids
         }
 
 
@@ -473,6 +544,14 @@ def align_segments_to_tokens(
         print(f"  Warning: Offset alignment failed ({e}), using heuristic")
         start_pos = min(seq_len // 4, seq_len - 1)
         token_mask[start_pos:] = 1
+
+    # CRITICAL FIX: If mask is still all zeros (segment alignment failed),
+    # fall back to marking all tokens as trainable. Better to train on everything
+    # than nothing - the model will still learn useful patterns.
+    if token_mask.sum() == 0:
+        print(f"  WARNING: All-zero mask after segment alignment. Falling back to training on all tokens.")
+        # Mark all tokens as trainable (will be filtered by attention_mask in training)
+        token_mask[:] = 1
 
     return token_mask
 

@@ -1,18 +1,18 @@
 # P-EAGLE Dependencies
 
 # Core
-torch>=2.0.0,<2.2.0
+torch>=2.0.0
 torchvision>=0.15.0
 torchaudio>=2.0.0
-numpy>=1.24.0,<2.0.0
+numpy>=1.24.0
 scipy>=1.10.0
 tqdm>=4.65.0
 
 # Transformers & NLP
-transformers>=4.35.0,<5.0.0
-tokenizers>=0.14.0,<0.24.0
-accelerate>=0.24.0,<1.0.0
-huggingface-hub>=0.19.0,<0.37.0
+transformers>=4.35.0
+tokenizers>=0.14.0
+accelerate>=0.24.0
+huggingface-hub>=0.19.0
 safetensors>=0.4.0
 
 # Quantization & Efficiency
@@ -36,9 +36,9 @@ pyyaml>=6.0.0
 python-dotenv>=1.0.0
 
 # Secret Scanning & Security (Required for pre-training verification)
-detect-secrets>=1.4.0           # Yelp's secret detection library
-gitpython>=3.1.0                # Git repository analysis
-requests>=2.31.0                # For downloading security tools
+detect-secrets>=1.4.0
+gitpython>=3.1.0
+requests>=2.31.0
 
 # Note: External tools required for full security scanning:
 #   gitleaks: Install via `wget https://github.com/zricethezav/gitleaks/releases/latest/download/gitleaks_$(uname)_$(uname -m).tar.gz`

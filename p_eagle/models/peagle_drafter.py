@@ -13,6 +13,59 @@ from transformers import AutoConfig, AutoModelForCausalLM
 from peft import LoraConfig, get_peft_model, TaskType, PeftModel
 from typing import Dict, List, Optional
 
+# Import Flash Attention
+from .flash_attention import (
+    FLASH_ATTN_AVAILABLE,
+    PEFlashAttention,
+    create_eagle3_flash_attention,
+    get_attention_backend
+)
+
+# CRITICAL: Monkey-patch Gemma3RotaryEmbedding BEFORE any model is loaded
+# This fixes the 'layer_type' parameter issue in Gemma3 models
+# The patch must be applied at module import time to catch all instantiations
+try:
+    import transformers.models.gemma3.modeling_gemma3 as _gemma3_module
+    _orig_rope_forward = _gemma3_module.Gemma3RotaryEmbedding.forward
+
+    def _patched_rope_forward(self, x, position_ids, layer_type=None, **kwargs):
+        """Patched forward that defaults layer_type to 'full_attention'."""
+        if layer_type is None:
+            layer_type = 'full_attention'
+        return _orig_rope_forward(self, x, position_ids, layer_type=layer_type, **kwargs)
+
+    _gemma3_module.Gemma3RotaryEmbedding.forward = _patched_rope_forward
+except (ImportError, AttributeError):
+    # Gemma3 not available or already patched
+    pass
+
+# Fix SDPA dtype mismatch: attention mask dtype must match query dtype
+try:
+    import transformers.integrations.sdpa_attention as _sdpa_module
+    _orig_sdpa_forward = _sdpa_module.sdpa_attention_forward
+
+    def _patched_sdpa_forward(module, query, key, value, attention_mask, dropout=0.0, scaling=None, is_causal=False, **kwargs):
+        """Patched SDPA that casts attention_mask to match query dtype."""
+        if attention_mask is not None and attention_mask.dtype != query.dtype:
+            attention_mask = attention_mask.to(query.dtype)
+        return _orig_sdpa_forward(module, query, key, value, attention_mask, dropout, scaling, is_causal, **kwargs)
+
+    _sdpa_module.sdpa_attention_forward = _patched_sdpa_forward
+except (ImportError, AttributeError):
+    pass
+
+# Also patch PyTorch's F.scaled_dot_product_attention directly
+# (some model modules cache the original function reference)
+import torch.nn.functional as _F
+_orig_torch_sdpa = _F.scaled_dot_product_attention
+
+def _patched_torch_sdpa(query, key, value, attn_mask=None, dropout_p=0.0, is_causal=False, scale=None, **kwargs):
+    if attn_mask is not None and hasattr(attn_mask, 'dtype') and attn_mask.dtype != query.dtype:
+        attn_mask = attn_mask.to(query.dtype)
+    return _orig_torch_sdpa(query, key, value, attn_mask=attn_mask, dropout_p=dropout_p, is_causal=is_causal, scale=scale, **kwargs)
+
+_F.scaled_dot_product_attention = _patched_torch_sdpa
+
 
 class Eagle3FirstLayer(nn.Module):
     """
@@ -220,7 +273,9 @@ class EagleDrafterModel(nn.Module):
         device: str = "cuda",
         use_hidden_injection: bool = True,
         injection_mode: str = "concat",
-        quantization: str = None
+        quantization: str = None,
+        use_flash_attention: bool = True,
+        mtp_dropout: float = 0.1,  # Dropout in MTP heads for regularization
     ):
         super().__init__()
 
@@ -229,6 +284,14 @@ class EagleDrafterModel(nn.Module):
         self.device = device
         self.use_hidden_injection = use_hidden_injection
         self.injection_mode = injection_mode
+        self.use_flash_attention = use_flash_attention and FLASH_ATTN_AVAILABLE
+
+        # Log attention backend
+        backend = get_attention_backend() if self.use_flash_attention else "standard"
+        print(f"Attention backend: {backend}")
+        if use_flash_attention and not FLASH_ATTN_AVAILABLE:
+            print("  (Flash Attention not available, install with: pip install flash-attn)")
+            print("  (Falling back to SDPA/manual attention)")
 
         # Use local cache to avoid re-downloading
         import os
@@ -241,6 +304,12 @@ class EagleDrafterModel(nn.Module):
             print(f"Quantization: {quantization}")
 
         self.config = AutoConfig.from_pretrained(base_model_name, cache_dir=cache_dir)
+
+        # Handle Gemma3-style nested config (multimodal models have text_config)
+        if hasattr(self.config, 'text_config') and self.config.text_config is not None:
+            self.text_config = self.config.text_config
+        else:
+            self.text_config = self.config
 
         # Setup quantization config if requested
         model_kwargs = {
@@ -270,7 +339,7 @@ class EagleDrafterModel(nn.Module):
             **model_kwargs
         )
 
-        self.hidden_dim = self.config.hidden_size
+        self.hidden_dim = self.text_config.hidden_size
         print(f"Base model hidden dim: {self.hidden_dim}")
         print(f"Target model hidden dim: {target_hidden_dim}")
 
@@ -278,6 +347,12 @@ class EagleDrafterModel(nn.Module):
         # 8-bit quant uses float16, 4-bit/non-quant uses bfloat16
         base_dtype = next(self.base_model.parameters()).dtype
         print(f"Base model dtype: {base_dtype}")
+
+        # Normalize all floating-point buffers to the model's dtype
+        # Fixes SDPA attention mask dtype mismatches
+        for buf in self.base_model.buffers():
+            if buf.dtype.is_floating_point and buf.dtype != base_dtype:
+                buf.data = buf.data.to(base_dtype)
 
         # ===== EAGLE-3: MODIFY FIRST LAYER FOR 2x HIDDEN SIZE INPUT =====
         # This is the CRITICAL fix - first layer must accept concatenated [embeds; target_hidden]
@@ -314,12 +389,80 @@ class EagleDrafterModel(nn.Module):
         ).to(device)
 
         self.mtp_heads = nn.ModuleList([
-            EagleMTPHead(target_hidden_dim, target_hidden_dim, num_layers=2, dtype=base_dtype).to(device)
+            EagleMTPHead(target_hidden_dim, target_hidden_dim, num_layers=2, dropout=mtp_dropout, dtype=base_dtype).to(device)
             for _ in range(speculation_depth)
         ])
+        print(f"MTP dropout: {mtp_dropout}")
 
         print(f"Initialized {speculation_depth} parallel MTP heads")
         print(f"EAGLE-3 mode: First layer accepts 2x hidden size input via concatenation")
+
+        # Optionally patch remaining layers with Flash Attention
+        if self.use_flash_attention:
+            self._patch_remaining_layers_with_flash_attention(dtype)
+
+    def _patch_remaining_layers_with_flash_attention(self, dtype: torch.dtype):
+        """Patch remaining transformer layers with Flash Attention for full optimization."""
+        base_model = self.base_model
+        if hasattr(base_model, 'model'):
+            base_model = base_model.model
+
+        if not hasattr(base_model, 'layers'):
+            return
+
+        num_patched = 0
+        for idx in range(1, len(base_model.layers)):  # Skip first layer (already handled)
+            layer = base_model.layers[idx]
+            if not hasattr(layer, 'self_attn'):
+                continue
+
+            attn_module = layer.self_attn
+
+            # Get attention config
+            hidden_size = self.hidden_dim
+            num_heads = getattr(self.text_config, 'num_attention_heads', 32)
+            num_kv_heads = getattr(self.text_config, 'num_key_value_heads', num_heads)
+            head_dim = getattr(self.text_config, 'head_dim', hidden_size // num_heads)
+            attention_bias = getattr(self.text_config, 'attention_bias', False)
+
+            # Create Flash Attention module
+            flash_attn = PEFlashAttention(
+                hidden_size=hidden_size,
+                num_heads=num_heads,
+                num_key_value_heads=num_kv_heads,
+                head_dim=head_dim,
+                bias=attention_bias,
+                dtype=dtype,
+                device=self.device,
+                eagle3_input_mult=1,  # Standard layers have 1x input
+                output_mult=1,
+            )
+
+            # Copy weights from original attention
+            try:
+                with torch.no_grad():
+                    flash_attn.q_proj.weight.copy_(attn_module.q_proj.weight)
+                    flash_attn.k_proj.weight.copy_(attn_module.k_proj.weight)
+                    flash_attn.v_proj.weight.copy_(attn_module.v_proj.weight)
+                    flash_attn.o_proj.weight.copy_(attn_module.o_proj.weight)
+
+                    # Copy biases if present
+                    for dst, src in [
+                        (flash_attn.q_proj, attn_module.q_proj),
+                        (flash_attn.k_proj, attn_module.k_proj),
+                        (flash_attn.v_proj, attn_module.v_proj),
+                        (flash_attn.o_proj, attn_module.o_proj),
+                    ]:
+                        if src.bias is not None and dst.bias is not None:
+                            dst.bias.copy_(src.bias)
+
+                layer.self_attn = flash_attn
+                num_patched += 1
+            except RuntimeError as e:
+                print(f"  Warning: Could not patch layer {idx}: {e}")
+
+        if num_patched > 0:
+            print(f"  Patched {num_patched} additional layers with Flash Attention")
 
     def _modify_first_layer_for_concat_injection(self, dtype: torch.dtype):
         """
@@ -329,6 +472,7 @@ class EagleDrafterModel(nn.Module):
         1. Replace q/k/v projections with 2x hidden_size input
         2. Wrap the layer with Eagle3FirstLayer to handle dimension mismatch
            (2x input -> attention -> project back to hidden_size for residual)
+        3. Optionally use Flash Attention for optimized computation
         """
         base_model = self.base_model
         if hasattr(base_model, 'model'):
@@ -341,8 +485,8 @@ class EagleDrafterModel(nn.Module):
             print("Warning: Could not find layers attribute, skipping first layer modification")
             return
 
-        # Detect model type for proper norm class
-        model_type = getattr(self.config, 'model_type', '').lower()
+        # Detect model type for proper norm class (use text_config for multimodal models)
+        model_type = getattr(self.text_config, 'model_type', '').lower()
 
         # Get appropriate RMSNorm class
         if 'llama' in model_type:
@@ -362,47 +506,65 @@ class EagleDrafterModel(nn.Module):
         # Store original layer
         self.original_first_layer = first_layer
 
-        # Replace q/k/v projections with 2x hidden size versions
+        # Get attention config
         hidden_size = self.hidden_dim
-        num_heads = getattr(self.config, 'num_attention_heads', 32)
-        num_kv_heads = getattr(self.config, 'num_key_value_heads', num_heads)
-        head_dim = getattr(self.config, 'head_dim', hidden_size // num_heads)
-        attention_bias = getattr(self.config, 'attention_bias', False)
+        num_heads = getattr(self.text_config, 'num_attention_heads', 32)
+        num_kv_heads = getattr(self.text_config, 'num_key_value_heads', num_heads)
+        head_dim = getattr(self.text_config, 'head_dim', hidden_size // num_heads)
+        attention_bias = getattr(self.text_config, 'attention_bias', False)
 
         # Get the attention module
         attn_module = first_layer.self_attn
 
-        # Replace projections with 2x input/output size versions
-        attn_module.q_proj = nn.Linear(
-            2 * hidden_size,
-            num_heads * head_dim,
-            bias=attention_bias,
-            dtype=dtype,
-            device=self.device
-        )
-        attn_module.k_proj = nn.Linear(
-            2 * hidden_size,
-            num_kv_heads * head_dim,
-            bias=attention_bias,
-            dtype=dtype,
-            device=self.device
-        )
-        attn_module.v_proj = nn.Linear(
-            2 * hidden_size,
-            num_kv_heads * head_dim,
-            bias=attention_bias,
-            dtype=dtype,
-            device=self.device
-        )
-        # CRITICAL: Also modify o_proj to output 2x hidden size
-        # This ensures attention output can be projected back to hidden_size
-        attn_module.o_proj = nn.Linear(
-            num_heads * head_dim,
-            2 * hidden_size,  # Output 2x to match concatenated dimensions
-            bias=attention_bias,
-            dtype=dtype,
-            device=self.device
-        )
+        # Use Flash Attention if enabled
+        if self.use_flash_attention:
+            print(f"  Replacing attention with Flash Attention (EAGLE-3 compatible)")
+            flash_attn = PEFlashAttention(
+                hidden_size=hidden_size,
+                num_heads=num_heads,
+                num_key_value_heads=num_kv_heads,
+                head_dim=head_dim,
+                bias=attention_bias,
+                dtype=dtype,
+                device=self.device,
+                eagle3_input_mult=2,  # EAGLE-3: 2x input
+                output_mult=2,  # EAGLE-3: 2x output
+            )
+            first_layer.self_attn = flash_attn
+            self.flash_attention_installed = True
+        else:
+            # Standard attention: Replace q/k/v projections with 2x hidden size versions
+            attn_module.q_proj = nn.Linear(
+                2 * hidden_size,
+                num_heads * head_dim,
+                bias=attention_bias,
+                dtype=dtype,
+                device=self.device
+            )
+            attn_module.k_proj = nn.Linear(
+                2 * hidden_size,
+                num_kv_heads * head_dim,
+                bias=attention_bias,
+                dtype=dtype,
+                device=self.device
+            )
+            attn_module.v_proj = nn.Linear(
+                2 * hidden_size,
+                num_kv_heads * head_dim,
+                bias=attention_bias,
+                dtype=dtype,
+                device=self.device
+            )
+            # CRITICAL: Also modify o_proj to output 2x hidden size
+            # This ensures attention output can be projected back to hidden_size
+            attn_module.o_proj = nn.Linear(
+                num_heads * head_dim,
+                2 * hidden_size,  # Output 2x to match concatenated dimensions
+                bias=attention_bias,
+                dtype=dtype,
+                device=self.device
+            )
+            self.flash_attention_installed = False
 
         # WRAP the first layer with Eagle3FirstLayer
         # This handles the dimension mismatch: 2x input -> attention -> project to hidden
@@ -412,26 +574,15 @@ class EagleDrafterModel(nn.Module):
         # Replace the layer in the model
         base_model.layers[0] = wrapped_layer
 
-        # Fix Gemma3 rotary_emb layer_type - set default to 'full_attention'
-        # This prevents the 'None_inv_freq' error when layer_type is not specified
+        # Store reference to modified first layer for forward pass
+        self.modified_first_layer = wrapped_layer
+
+        # Log that rotary_emb patch was applied at module import time
         if hasattr(base_model, 'rotary_emb'):
-            import transformers.models.gemma3.modeling_gemma3 as gemma3_module
+            print(f"  Using Gemma3RotaryEmbedding with patched layer_type='full_attention'")
 
-            # Capture the module and original forward at definition time
-            _gemma3_module = gemma3_module
-            _orig_forward = gemma3_module.Gemma3RotaryEmbedding.forward
-
-            def _patched_rope_forward(self, x, position_ids, layer_type=None, **kwargs):
-                # Default to 'full_attention' if layer_type not specified
-                # Valid values are 'full_attention' and 'sliding_attention'
-                if layer_type is None:
-                    layer_type = 'full_attention'
-                return _orig_forward(self, x, position_ids, layer_type=layer_type, **kwargs)
-
-            _gemma3_module.Gemma3RotaryEmbedding.forward = _patched_rope_forward
-            print(f"  Patched Gemma3RotaryEmbedding.forward to default layer_type='full_attention'")
-
-        print(f"Modified first layer: 2x hidden input ({2 * hidden_size}) with Eagle3FirstLayer wrapper")
+        attn_type = "Flash Attention" if self.use_flash_attention else "Standard Attention"
+        print(f"Modified first layer: 2x hidden input ({2 * hidden_size}) with {attn_type}")
 
     def forward(
         self,
@@ -490,20 +641,30 @@ class EagleDrafterModel(nn.Module):
 
         # Handle attention mask creation if needed
         if attention_mask is not None:
-            # Expand for multi-head attention
             batch_size, seq_length = input_ids.shape
-            # Create causal mask
+            # CORRECT causal mask: -inf for future positions (mask OUT), 0 for present/past
+            # HF transformers add this mask to attention scores, so -inf -> zero after softmax
             causal_mask = torch.triu(
-                torch.ones(seq_length, seq_length, device=hidden_states.device),
+                torch.full((seq_length, seq_length), float('-inf'), device=hidden_states.device),
                 diagonal=1
-            ).bool()
+            )
             causal_mask = causal_mask.unsqueeze(0).unsqueeze(0)  # [1, 1, seq_len, seq_len]
             causal_mask = causal_mask.expand(batch_size, 1, seq_length, seq_length)
         else:
             causal_mask = None
 
         # Process first layer with EAGLE-3 handling (wrapped with Eagle3FirstLayer)
-        first_layer = base_model.layers[0]
+        # CRITICAL FIX: Try multiple methods to find the first layer
+        # Method 1: Use stored reference if available
+        if hasattr(self, 'modified_first_layer') and self.modified_first_layer is not None:
+            first_layer = self.modified_first_layer
+        # Method 2: Navigate through model structure
+        elif hasattr(base_model, 'layers'):
+            first_layer = base_model.layers[0]
+        elif hasattr(self.base_model, 'model') and hasattr(self.base_model.model, 'layers'):
+            first_layer = self.base_model.model.layers[0]
+        else:
+            raise AttributeError(f"Could not find layers attribute. Model type: {type(self.base_model)}")
 
         # Compute position embeddings for rotary attention (needed for Gemma3, Qwen2, etc.)
         batch_size, seq_len = hidden_states.shape[0], hidden_states.shape[1]
@@ -511,9 +672,19 @@ class EagleDrafterModel(nn.Module):
         position_ids = position_ids.unsqueeze(0).expand(batch_size, -1)
 
         # Get rotary embeddings from model
+        # CRITICAL FIX: Try multiple paths to find rotary_emb for different model architectures
         position_embeddings = None
+        rotary_emb = None
+
+        # Try different paths where rotary_emb might be located
         if hasattr(base_model, 'rotary_emb'):
             rotary_emb = base_model.rotary_emb
+        elif hasattr(self.base_model, 'model') and hasattr(self.base_model.model, 'rotary_emb'):
+            rotary_emb = self.base_model.model.rotary_emb
+        elif hasattr(self.base_model, 'model') and hasattr(self.base_model.model, 'model') and hasattr(self.base_model.model.model, 'rotary_emb'):
+            rotary_emb = self.base_model.model.model.rotary_emb
+
+        if rotary_emb is not None:
             # The rotary_emb was already patched in _modify_first_layer_for_concat_injection
             # to always use layer_type='global', so no need to set it here
             cos, sin = rotary_emb(hidden_states, position_ids)
@@ -529,7 +700,19 @@ class EagleDrafterModel(nn.Module):
 
         # Process remaining layers normally
         # Note: First layer output is now [batch, seq, hidden_size] (projected back from 2x)
-        for layer in base_model.layers[1:]:
+        # CRITICAL FIX: Ensure we have the correct layers reference for Gemma3 models
+        remaining_layers = None
+        if hasattr(base_model, 'layers'):
+            remaining_layers = base_model.layers[1:]
+        elif hasattr(self.base_model, 'model') and hasattr(self.base_model.model, 'layers'):
+            remaining_layers = self.base_model.model.layers[1:]
+        elif hasattr(self.base_model, 'model') and hasattr(self.base_model.model, 'model') and hasattr(self.base_model.model.model, 'layers'):
+            remaining_layers = self.base_model.model.model.layers[1:]
+
+        if remaining_layers is None:
+            raise AttributeError(f"Could not find layers to iterate. Model type: {type(self.base_model)}")
+
+        for layer in remaining_layers:
             # Qwen2 layers expect position_embeddings for rotary attention
             layer_kwargs = {"attention_mask": causal_mask}
             if position_embeddings is not None:
@@ -542,9 +725,11 @@ class EagleDrafterModel(nn.Module):
             else:
                 hidden_states = layer_output
 
-        # Final norm
+        # Final norm - try multiple paths
         if hasattr(base_model, 'norm'):
             hidden_states = base_model.norm(hidden_states)
+        elif hasattr(self.base_model, 'model') and hasattr(self.base_model.model, 'norm'):
+            hidden_states = self.base_model.model.norm(hidden_states)
 
         base_hidden = hidden_states
 
@@ -686,7 +871,7 @@ class EagleDrafterModel(nn.Module):
 
         # Save hidden injection layer if enabled
         if self.use_hidden_injection:
-            checkpoint_data["hidden_injection"] = self.hidden_injection.state_dict()
+            checkpoint_data["target_hidden_proj"] = self.target_hidden_proj.state_dict()
 
         # Save target lm_head if provided (for vocab compatibility during inference)
         if target_lm_head is not None:
@@ -701,6 +886,7 @@ class EagleDrafterModel(nn.Module):
             "target_hidden_dim": self.target_hidden_dim,
             "use_hidden_injection": self.use_hidden_injection,
             "injection_mode": self.injection_mode,
+            "use_flash_attention": self.use_flash_attention,
             "vocab_size": target_lm_head.weight.shape[0] if target_lm_head is not None else None
         }
         with open(Path(checkpoint_dir) / "config.json", "w") as f:
@@ -718,6 +904,7 @@ class EagleDrafterModel(nn.Module):
         # Load hidden injection settings from checkpoint (default to False for backward compat)
         use_hidden_injection = config.get("use_hidden_injection", False)
         injection_mode = config.get("injection_mode", "concat")
+        use_flash_attention = config.get("use_flash_attention", True)  # Default to True for new models
 
         # Check if LoRA weights exist
         lora_weights_path = Path(checkpoint_dir) / "lora_weights"
@@ -731,7 +918,8 @@ class EagleDrafterModel(nn.Module):
             use_lora=False,  # Start with base model
             device=device,
             use_hidden_injection=use_hidden_injection,
-            injection_mode=injection_mode
+            injection_mode=injection_mode,
+            use_flash_attention=use_flash_attention,
         )
 
         # Load LoRA weights if they exist
@@ -756,8 +944,8 @@ class EagleDrafterModel(nn.Module):
             model.mtp_heads[i].load_state_dict(head_state)
 
         # Load hidden injection layer if present
-        if use_hidden_injection and "hidden_injection" in checkpoint:
-            model.hidden_injection.load_state_dict(checkpoint["hidden_injection"])
+        if use_hidden_injection and "target_hidden_proj" in checkpoint:
+            model.target_hidden_proj.load_state_dict(checkpoint["target_hidden_proj"])
 
         # Load target lm_head if present (for vocab compatibility)
         if "target_lm_head" in checkpoint:
