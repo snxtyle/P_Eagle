@@ -268,7 +268,10 @@ def generate_workflow_gif(output_path="docs/p-eagle-workflow.gif"):
     os.makedirs(os.path.dirname(output_path) if os.path.dirname(output_path) else ".", exist_ok=True)
 
     frames = []
-    font = load_font(FONT_SIZE)
+
+    # Use smaller dimensions for workflow GIF (more compact)
+    workflow_width = 900
+    workflow_height = 300
 
     stages = [
         [],  # Empty
@@ -284,18 +287,22 @@ def generate_workflow_gif(output_path="docs/p-eagle-workflow.gif"):
 
     print("Generating workflow frames...")
     for i, components in enumerate(stages):
-        img = Image.new('RGB', (WIDTH, HEIGHT), BG_COLOR)
+        img = Image.new('RGB', (workflow_width, workflow_height), BG_COLOR)
         draw = ImageDraw.Draw(img)
 
-        # Title
+        font = load_font()
         font_title = load_font(18)
-        draw.text((WIDTH // 2 - 150, 20), "Data Pipeline Workflow", font=font_title, fill=WHITE)
+        font_small = load_font(12)
 
-        # Draw pipeline boxes
-        box_width = 120
-        box_height = 60
-        spacing = 40
-        start_x = 80
+        # Title - positioned higher
+        draw.text((workflow_width // 2 - 150, 20), "Data Pipeline Workflow", font=font_title, fill=WHITE)
+
+        # Draw pipeline boxes - centered vertically
+        box_width = 140
+        box_height = 70
+        spacing = 20
+        total_width = 5 * box_width + 4 * spacing
+        start_x = (workflow_width - total_width) // 2
         y_pos = 100
 
         labels = ["RAW", "PROCESSED", "FEATURES", "TRAINING", "CHECKPOINTS"]
@@ -304,21 +311,34 @@ def generate_workflow_gif(output_path="docs/p-eagle-workflow.gif"):
         for j, (label, color) in enumerate(zip(labels, colors)):
             if label.lower() in components:
                 bx = start_x + j * (box_width + spacing)
-                draw.rectangle([bx, y_pos, bx + box_width, y_pos + box_height], fill=color, outline=color)
-                draw.text((bx + 10, y_pos + 20), label, font=font, fill=WHITE if color != WHITE else BG_COLOR)
 
-                # Arrow to next
+                # Draw filled rectangle
+                draw.rectangle([bx, y_pos, bx + box_width, y_pos + box_height], fill=color, outline=WHITE, width=2)
+
+                # Draw label centered
+                text_bbox = draw.textbbox((0, 0), label, font=font)
+                text_width = text_bbox[2] - text_bbox[0]
+                text_x = bx + (box_width - text_width) // 2
+                draw.text((text_x, y_pos + 15), label, font=font, fill=WHITE)
+
+                # Arrow to next box
                 if j < 4 and labels[j+1].lower() in components:
                     ax = bx + box_width
-                    draw.line([(ax, y_pos + box_height//2), (ax + spacing, y_pos + box_height//2)], fill=DIM_GRAY, width=2)
+                    # Draw arrow
+                    draw.line([(ax, y_pos + box_height//2), (ax + spacing//2, y_pos + box_height//2)], fill=WHITE, width=2)
+                    draw.polygon([(ax + spacing//2, y_pos + box_height//2 - 5),
+                                  (ax + spacing//2, y_pos + box_height//2 + 5),
+                                  (ax + spacing, y_pos + box_height//2)], fill=WHITE)
 
-        # Show outputs
+        # Show output info at bottom
         if "training" in components or "inference" in components or "evaluate" in components:
-            out_y = y_pos + box_height + 40
-            draw.text((80, out_y), "Outputs: Inference (Speculative Decoding) | Evaluate (Metrics)", font=font, fill=DIM_GRAY)
+            out_y = y_pos + box_height + 25
+            draw.text(((workflow_width - 500) // 2, out_y), "Inference (Speculative Decoding)  |  Evaluate (Metrics)", font=font_small, fill=DIM_GRAY)
 
-        # Footer
-        draw.text((20, HEIGHT - 30), "P-EAGLE Pipeline: data → features → training → inference", font=load_font(12), fill=DIM_GRAY)
+        # Footer with arrows
+        footer_y = workflow_height - 40
+        arrows = "→".join(["Data", "Process", "Features", "Train", "Inference"])
+        draw.text(((workflow_width - 400) // 2, footer_y), arrows, font=font_small, fill=DIM_GRAY)
 
         frames.append(img)
         print(f"  Frame {i+1}/{len(stages)}: {components if components else 'empty'}")

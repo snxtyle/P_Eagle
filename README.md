@@ -90,13 +90,44 @@ print(f"Acceptance rate: {result.acceptance_rate:.1%}")
 
 ## Configuration
 
-| Parameter | Default | Description |
-|-----------|---------|-------------|
+| Parameter | Value Used | Description |
+|-----------|-----------|-------------|
+| `drafter_model` | google/gemma-3-270m-it | Base model for drafter |
+| `target_hidden_dim` | 2560 | Target model hidden dimension |
 | `speculation_depth` | 4 | Number of parallel predictions (K) |
 | `lora_rank` | 64 | LoRA adaptation rank |
-| `batch_size` | 16 | Training batch size |
-| `max_seq_len` | 2048 | Maximum sequence length |
-| `learning_rate` | 1e-5 | Training learning rate |
+| `lora_alpha` | 256 | LoRA scaling factor |
+| `learning_rate` | 5e-5 | Training learning rate |
+| `num_epochs` | 1 | Training epochs |
+| `max_seq_len` | 32768 | Maximum sequence length |
+| `batch_size` | 1 | Training batch size |
+| `gradient_accumulation_steps` | 8 | Gradient accumulation |
+| `shard_cache_size` | 2 | Feature shard cache size |
+| `use_flash_attention` | true | Enable flash attention |
+| `save_every` | 10 | Save checkpoint every N steps |
+
+**Example Training Command:**
+```bash
+pkill -f "p_eagle.training.trainer"
+
+/home/suraj/Desktop/P_Eagle/venv/bin/python -m p_eagle.training.trainer \
+  --drafter_model google/gemma-3-270m-it \
+  --feature_dir /home/suraj/Desktop/P_Eagle/data/features/subset_500 \
+  --output_dir /home/suraj/Desktop/P_Eagle/outputs/training_subset_500 \
+  --target_hidden_dim 2560 \
+  --use_lora --lora_rank 64 --lora_alpha 256 \
+  --learning_rate 5e-5 \
+  --num_epochs 1 \
+  --max_seq_len 32768 \
+  --batch_size 1 \
+  --gradient_accumulation_steps 8 \
+  --speculation_depth 4 \
+  --shard_cache_size 2 \
+  --use_flash_attention \
+  --save_every 10 \
+  --resume /home/suraj/Desktop/P_Eagle/outputs/training_subset_500/epoch_1_checkpoint \
+  --yes
+```
 
 ---
 
