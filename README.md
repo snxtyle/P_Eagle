@@ -168,6 +168,10 @@ python scripts/animate_workflow.py --speculative  # Speculative decoding
 
 ## Architecture
 
+### Animated Overview
+
+![P-EAGLE Architecture](docs/p-eagle-architecture.gif)
+
 ### EAGLE-3 Innovation
 
 P-EAGLE implements EAGLE-3, a novel speculative decoding architecture:
@@ -208,6 +212,8 @@ EAGLE-3 Injection:
 ---
 
 ## Data Pipeline
+
+![P-EAGLE Workflow](docs/p-eagle-workflow.gif)
 
 ```
 ┌─────────────┐    ┌─────────────┐    ┌─────────────┐    ┌──────────────────┐
