@@ -76,7 +76,7 @@ class FeatureExtractor:
         output_dir: str,
         tokenizer_name: str = None,
         quantization: str = "8bit",
-        layer_config: str = "early,middle,final",  # Tri-layer extraction
+        layer_config: str = "last",  # Last layer only (required for speculative decoding alignment)
         fusion_mode: str = "mean",
         max_length: int = 4096,  # Increased for H200 141GB VRAM
         batch_size: int = 1,
@@ -228,37 +228,18 @@ class FeatureExtractor:
 
     @torch.no_grad()
     def extract_sample(self, samples):
-        """Extract features from a list of samples (batch).
-
-        OPTIMIZATION: Uses batch processing for better GPU utilization.
+        """Extract features from samples.
+        _extract_single now returns a list (one per chunk), so flatten here.
         """
-        # Use optimized batch processing for better GPU utilization
-        if len(samples) > 1:
+        results = []
+        for sample in samples:
             try:
-                return self._extract_batch_optimized(samples)
+                chunk_results = self._extract_single(sample)
+                if chunk_results is not None:
+                    results.extend(chunk_results)
             except Exception as e:
-                print(f"Batch processing failed, falling back to single: {e}")
-                # Fallback to single processing
-                results = []
-                for sample in samples:
-                    try:
-                        result = self._extract_single(sample)
-                        if result is not None:
-                            results.append(result)
-                    except Exception as e2:
-                        print(f"Error extracting sample: {e2}")
-                return results
-        else:
-            # Single sample - use original method
-            results = []
-            for sample in samples:
-                try:
-                    result = self._extract_single(sample)
-                    if result is not None:
-                        results.append(result)
-                except Exception as e:
-                    print(f"Error extracting sample: {e}")
-            return results
+                print(f"Error extracting sample: {e}")
+        return results
 
     def _parse_content(self, content):
         """Parse content that may be string-encoded JSON list or null.
@@ -313,22 +294,24 @@ class FeatureExtractor:
             return content
         return str(content)
 
+    @torch.no_grad()
     def _extract_single(self, batch_item):
-        """Extract features from a single sample."""
+        """Extract features from a single sample.
+        
+        Uses sliding window chunks for conversations longer than max_length.
+        Each chunk preserves the causal prefix but only saves the window portion.
+        Hard-caps at 131072 tokens to prevent OOM on extreme outliers.
+        """
         try:
             conversation_text = batch_item["conversation_text"]
             messages = batch_item["original_messages"]
 
-            # Parse complex content formats before processing
             for msg in messages:
                 if "content" in msg:
                     msg["content"] = self._parse_content(msg.get("content"))
 
-            # Auto-generate segments from message roles if not provided
-            # Train on assistant responses (mask=1), ignore system/user (mask=0)
             segments = batch_item.get("segments", [])
             if not segments and messages:
-                # FIX: Robust role detection - handle variations like "Assistant", "bot", "AI"
                 assistant_roles = {"assistant", "bot", "ai"}
                 segments = []
                 assistant_count = 0
@@ -336,7 +319,6 @@ class FeatureExtractor:
                     role = msg.get("role", "unknown").lower().strip()
                     content = msg.get("content", "")
                     is_assistant = role in assistant_roles
-                    # Skip assistant messages with empty content (no training signal)
                     if is_assistant and not content:
                         mask = 0
                     else:
@@ -345,94 +327,117 @@ class FeatureExtractor:
                             assistant_count += 1
                     segments.append({"index": i, "role": role, "mask": mask})
 
-                if assistant_count > 0:
-                    print(f"  Found {assistant_count}/{len(segments)} assistant messages to train on.")
-                else:
+                if assistant_count == 0:
                     print(f"  CRITICAL: No assistant messages found. Roles: {[m.get('role') for m in messages]}")
 
+            # Tokenize full conversation (no truncation)
             inputs = self.tokenizer(
                 conversation_text,
                 return_tensors="pt",
-                max_length=self.max_length,
-                truncation=True,
+                truncation=False,
                 padding=True
             )
-            input_ids = inputs["input_ids"].to(self.model.device)
-            attention_mask = inputs["attention_mask"].to(self.model.device)
+            full_input_ids = inputs["input_ids"].to(self.model.device)
+            full_attention = inputs["attention_mask"].to(self.model.device)
+            full_seq_len = full_input_ids.shape[1]
 
-            print(f"  Processing {input_ids.shape[1]} tokens...")
-            outputs = self.model(
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                output_hidden_states=True
+            # Hard cap at 131072 to prevent OOM on extreme outliers (3.4M word samples)
+            max_input_tokens = 131072
+            if full_seq_len > max_input_tokens:
+                print(f"  Truncating {full_seq_len} → {max_input_tokens} tokens (hard cap)")
+                full_input_ids = full_input_ids[:, :max_input_tokens]
+                full_attention = full_attention[:, :max_input_tokens]
+                full_seq_len = max_input_tokens
+
+            # Compute full segment mask once (reused across all chunks)
+            full_token_mask = align_segments_to_tokens(
+                messages, segments, self.tokenizer, full_input_ids[0]
             )
-            print(f"  Got hidden states")
+            if full_token_mask.sum().item() > 0:
+                print(f"  Mask covers {full_token_mask.sum().item()} trainable tokens")
 
-            all_hidden_states = outputs.hidden_states
+            def _make_chunk_result(hidden, raw_hn, inp_ids, attn_mask, tgt_ids, mask_slice):
+                return {
+                    "text": conversation_text,
+                    "input_ids": inp_ids.cpu(),
+                    "fused_hidden_states": hidden.cpu(),
+                    "raw_hidden_states": raw_hn.cpu(),
+                    "norm_mean": None,
+                    "norm_std": None,
+                    "loss_mask": mask_slice.cpu(),
+                    "attention_mask": attn_mask.cpu(),
+                    "target_token_ids": tgt_ids.cpu(),
+                }
 
-            # CRITICAL FIX: Save actual target token IDs from model's own logits.
-            # These are the ground-truth next-token predictions that the lm_head
-            # produces from the LAST layer. We save them explicitly so training
-            # uses correct targets regardless of which layer(s) we extract for
-            # hidden-state MSE loss.
-            target_token_ids = outputs.logits.argmax(dim=-1)  # [batch, seq_len]
-
-            if self.layer_config.mode == "last":
-                # Use last layer hidden state directly (guaranteed lm_head compatible)
-                last_hidden = all_hidden_states[-1]  # [batch, seq, hidden_dim]
-
-                # Apply final norm so hidden states are lm_head-ready
-                # (the model's lm_head expects normed input, not raw layer output)
+            def _norm_last_layer(hs):
                 if hasattr(self.model, 'model') and hasattr(self.model.model, 'norm'):
-                    normed = self.model.model.norm(last_hidden)
+                    return self.model.model.norm(hs)
                 elif hasattr(self.model, 'norm'):
-                    normed = self.model.norm(last_hidden)
-                else:
-                    normed = last_hidden
+                    return self.model.norm(hs)
+                return hs
 
-                fused_hidden = normed[0]
-                raw_hidden = normed[0]
-                mean_stats = None
-                std_stats = None
-            else:
-                fusion_result = fuse_tri_layer_features(
-                    all_hidden_states,
-                    self.layer_config.layer_indices,
-                    self.fusion_mode
+            if full_seq_len <= self.max_length:
+                print(f"  Processing {full_seq_len} tokens...")
+                outputs = self.model(
+                    input_ids=full_input_ids,
+                    attention_mask=full_attention,
+                    output_hidden_states=True
                 )
-                fused_hidden = fusion_result['fused']
-                raw_hidden = fusion_result['raw']
-                mean_stats = fusion_result['mean']
-                std_stats = fusion_result['std']
+                target_ids = outputs.logits.argmax(dim=-1)[0]
+                hidden = _norm_last_layer(outputs.hidden_states[-1][0])
 
-            token_level_mask = align_segments_to_tokens(
-                messages,
-                segments,
-                self.tokenizer,
-                input_ids[0]
-            )
+                if full_token_mask.sum().item() == 0:
+                    print("  WARNING: Empty loss mask")
 
-            # Sanity check: verify mask has trainable positions
-            mask_sum = token_level_mask.sum().item()
-            if mask_sum == 0:
-                print(f"  WARNING: Empty loss mask for sample! Check segment alignment.")
-            else:
-                print(f"  Mask covers {mask_sum} trainable tokens")
+                return [_make_chunk_result(
+                    hidden, hidden,
+                    full_input_ids[0], full_attention[0],
+                    target_ids, full_token_mask
+                )]
 
-            return {
-                "text": conversation_text,  # Store for flexible retokenization
-                "input_ids": input_ids[0].cpu(),
-                "fused_hidden_states": fused_hidden.cpu(),  # [seq, hidden_dim] - FIXED: removed [0]
-                "raw_hidden_states": raw_hidden.cpu(),      # [seq, hidden_dim] - FIXED: removed [0]
-                "norm_mean": mean_stats[0].cpu() if mean_stats is not None else None,
-                "norm_std": std_stats[0].cpu() if std_stats is not None else None,
-                "loss_mask": token_level_mask.cpu(),
-                "attention_mask": attention_mask[0].cpu(),
-                "target_token_ids": target_token_ids[0].cpu()  # Actual next-token preds from model logits
-            }
+            # Standalone overlapping chunks — each chunk is processed independently
+            # at exactly max_length tokens (no prefix accumulation, avoids OOM)
+            chunk_size = self.max_length
+            overlap = min(8192, chunk_size // 4)
+            stride = chunk_size - overlap
+
+            results = []
+            for start in range(0, full_seq_len, stride):
+                end = min(start + chunk_size, full_seq_len)
+                window_len = end - start
+                if window_len < min(4096, chunk_size // 4):
+                    break
+
+                chunk_input = full_input_ids[:, start:end]
+                chunk_attn = full_attention[:, start:end]
+
+                print(f"  Chunk [{start}:{end}] ({window_len} tokens) of {full_seq_len}...")
+                outputs = self.model(
+                    input_ids=chunk_input,
+                    attention_mask=chunk_attn,
+                    output_hidden_states=True
+                )
+
+                hidden = _norm_last_layer(outputs.hidden_states[-1][0])
+                target_ids = outputs.logits.argmax(dim=-1)[0]
+                mask_slice = full_token_mask[start:end]
+
+                results.append(_make_chunk_result(
+                    hidden, hidden,
+                    full_input_ids[0, start:end], full_attention[0, start:end],
+                    target_ids, mask_slice
+                ))
+
+                del outputs
+                torch.cuda.empty_cache()
+
+            print(f"  → {len(results)} chunks from {full_seq_len} tokens")
+            return results
 
         except Exception as e:
             print(f"Error extracting sample: {e}")
+            import traceback
+            traceback.print_exc()
             return None
 
     @torch.no_grad()
@@ -480,8 +485,7 @@ class FeatureExtractor:
             inputs = self.tokenizer(
                 all_texts,
                 return_tensors="pt",
-                max_length=self.max_length,
-                truncation=True,
+                truncation=False,
                 padding=True  # Pad to longest in batch
             )
 
@@ -565,7 +569,9 @@ class FeatureExtractor:
             dataset,
             batch_size=self.batch_size,
             shuffle=False,
-            collate_fn=collate_fn
+            collate_fn=collate_fn,
+            num_workers=4,
+            prefetch_factor=2
         )
 
         all_features = []
@@ -684,12 +690,12 @@ def main():
     parser.add_argument("--input_data", required=True)
     parser.add_argument("--output_dir", default="./features")
     parser.add_argument("--quantization", default="8bit", choices=["4bit", "8bit", "none"])
-    parser.add_argument("--layers", default="early,middle,final",
-                        help="Which layers to extract: 'early,middle,final' (default), 'last', 'first,middle,last', or comma-separated indices")
+    parser.add_argument("--layers", default="last",
+                        help="Which layers to extract: 'last' (default — required for speculative decoding), 'early,middle,final', 'first,middle,last', or comma-separated indices")
     parser.add_argument("--fusion", default="mean", choices=["mean", "weighted", "concat", "none"],
                         help="How to fuse multiple layers: 'mean' (default), 'weighted', 'concat', 'none'")
-    parser.add_argument("--max_length", type=int, default=2048,
-                        help="Max sequence length (default: 2048)")
+    parser.add_argument("--max_length", type=int, default=65535,
+                        help="Max sequence length (default: 65535 — effectively no truncation)")
     parser.add_argument("--batch_size", type=int, default=1)
     parser.add_argument("--shard_size", type=int, default=50,
                         help="Samples per shard (default: 50 for ~2GB shards)")

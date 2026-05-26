@@ -35,7 +35,7 @@ import numpy as np
 from pathlib import Path
 from typing import List, Dict, Tuple, Optional, Any
 
-from transformers import AutoTokenizer, AutoModelForCausalLM
+from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig
 
 torch._inductor.config.triton.cudagraphs = False
 os.environ["TORCHINDUCTOR_CUDAGRAPHS"] = "0"
@@ -271,7 +271,8 @@ def calculate_text_equivalence(
 
 
 def evaluate_baseline(target_model_name: str, prompts: List[str], max_tokens: int = 100,
-                      temperature: float = 0.7, top_p: float = 0.9) -> Dict:
+                      temperature: float = 0.7, top_p: float = 0.9,
+                      quantization: str = "none") -> Dict:
     """Evaluate raw target model baseline with comprehensive metrics."""
     print("\n" + "="*70)
     print("  BASELINE: Raw Target Model")
@@ -281,12 +282,14 @@ def evaluate_baseline(target_model_name: str, prompts: List[str], max_tokens: in
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
-    print(f"Loading {target_model_name}...")
-    model = AutoModelForCausalLM.from_pretrained(
-        target_model_name,
-        torch_dtype=torch.bfloat16,
-        device_map="auto"
-    )
+    print(f"Loading {target_model_name} (quantization={quantization})...")
+    load_kwargs = {"device_map": "auto"}
+    quant_config = _get_quant_config(quantization)
+    if quant_config is not None:
+        load_kwargs["quantization_config"] = quant_config
+    else:
+        load_kwargs["torch_dtype"] = torch.bfloat16
+    model = AutoModelForCausalLM.from_pretrained(target_model_name, **load_kwargs)
     model.eval()
 
     results = []
@@ -355,9 +358,18 @@ def evaluate_baseline(target_model_name: str, prompts: List[str], max_tokens: in
     }
 
 
+def _get_quant_config(quantization: str):
+    if quantization == "8bit":
+        return BitsAndBytesConfig(load_in_8bit=True)
+    elif quantization == "4bit":
+        return BitsAndBytesConfig(load_in_4bit=True, bnb_4bit_compute_dtype=torch.bfloat16)
+    return None
+
+
 def evaluate_speculative(drafter_checkpoint: str, target_model_name: str,
                          prompts: List[str], max_tokens: int = 100,
-                         temperature: float = 0.7, top_p: float = 0.9) -> Dict:
+                         temperature: float = 0.7, top_p: float = 0.9,
+                         quantization: str = "none") -> Dict:
     """Evaluate with TRUE speculative decoding (no teacher forcing).
 
     Calculates comprehensive metrics including:
@@ -377,18 +389,45 @@ def evaluate_speculative(drafter_checkpoint: str, target_model_name: str,
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
-    # Load target model for verification
-    print(f"Loading target model: {target_model_name}...")
-    target_model = AutoModelForCausalLM.from_pretrained(
-        target_model_name,
-        torch_dtype=torch.bfloat16,
-        device_map="auto"
-    ).to("cuda")
+    # Load target model for verification (use same quantization as feature extraction)
+    print(f"Loading target model: {target_model_name} (quantization={quantization})...")
+    load_kwargs = {"device_map": "auto"}
+    quant_config = _get_quant_config(quantization)
+    if quant_config is not None:
+        load_kwargs["quantization_config"] = quant_config
+    else:
+        load_kwargs["torch_dtype"] = torch.bfloat16
+    target_model = AutoModelForCausalLM.from_pretrained(target_model_name, **load_kwargs)
     target_model.eval()
 
     # Load drafter
     print(f"Loading drafter from {drafter_checkpoint}...")
-    drafter = EagleDrafterModel.load_checkpoint(drafter_checkpoint, device="cuda")
+
+    # Check if drafter_checkpoint is a HuggingFace model ID or a local checkpoint
+    is_hf_model = "/" in drafter_checkpoint and not os.path.exists(drafter_checkpoint)
+
+    if is_hf_model:
+        # For base model evaluation: we need to know the dimensions
+        # gemma-3-270m-it: 640 hidden dim, gemma-3-4b-it: 2560 hidden dim
+        base_drafter_dim = 640
+        base_target_dim = 2560
+
+        # Create EagleDrafterModel with untrained weights
+        from p_eagle.models.peagle_drafter import EagleDrafterModel
+        drafter = EagleDrafterModel(
+            base_model_name=drafter_checkpoint,
+            target_hidden_dim=base_target_dim,
+            speculation_depth=4,  # Use default K=4
+            use_lora=False,
+            device="cuda",
+            use_hidden_injection=True,
+            injection_mode="concat"
+        )
+        print(f"Created untrained drafter model with MTP heads for: {drafter_checkpoint}")
+    else:
+        # Load trained P-EAGLE checkpoint
+        drafter = EagleDrafterModel.load_checkpoint(drafter_checkpoint, device="cuda")
+
     drafter.eval()
 
     # Get the target model's lm_head for token generation
@@ -444,6 +483,11 @@ def evaluate_speculative(drafter_checkpoint: str, target_model_name: str,
         acceptance_counts = []
         num_verification_passes = 0
 
+        # Get initial target hidden states for the prompt prefix
+        with torch.no_grad():
+            init_outputs = target_model(generated, output_hidden_states=True)
+            target_hidden = init_outputs.hidden_states[-1]  # [1, seq_len, target_hidden_dim]
+
         # Speculative decoding loop
         for _ in range(max_tokens):
             if generated.shape[1] >= original_length + max_tokens:
@@ -453,7 +497,7 @@ def evaluate_speculative(drafter_checkpoint: str, target_model_name: str,
             with torch.no_grad():
                 drafter_outputs = drafter.forward(
                     input_ids=generated,
-                    target_hidden=None,
+                    target_hidden=target_hidden,
                     is_training=False
                 )
                 mtp_predictions = drafter_outputs["mtp_predictions"]
@@ -475,8 +519,9 @@ def evaluate_speculative(drafter_checkpoint: str, target_model_name: str,
             num_verification_passes += 1
 
             with torch.no_grad():
-                verify_outputs = target_model(verify_input)
+                verify_outputs = target_model(verify_input, output_hidden_states=True)
                 verify_logits = verify_outputs.logits[0, generated.shape[1]-1:, :]
+                verify_hidden = verify_outputs.hidden_states[-1]  # [1, verify_len, target_hidden_dim]
 
             # Step 3: Accept/reject tokens
             accepted_count = 0
@@ -508,6 +553,9 @@ def evaluate_speculative(drafter_checkpoint: str, target_model_name: str,
                 generated = torch.cat([generated, new_token], dim=1)
                 acceptance_counts.append(0)
                 total_drafted += len(draft_tokens)
+
+            # Update target_hidden from verification outputs (covers the new confirmed prefix)
+            target_hidden = verify_hidden[:, :generated.shape[1], :]
 
         elapsed = time.time() - start
         tokens_generated = generated.shape[1] - original_length
@@ -562,12 +610,10 @@ def evaluate_speculative(drafter_checkpoint: str, target_model_name: str,
         total_verification_passes
     )
 
-    # Calculate per-head acceptance rate using helper function
-    acceptance_by_head_pct = calculate_per_head_acceptance(
-        all_mal,  # Use counts for accurate per-head calculation
-        speculation_depth,
-        len(prompts)
-    )
+    # Calculate per-head acceptance rate from per-step acceptance data
+    acceptance_by_head_pct = {}
+    for head, counts in all_acceptance_by_head.items():
+        acceptance_by_head_pct[head] = (sum(counts) / len(counts) * 100) if counts else 0.0
 
     return {
         "drafter_checkpoint": drafter_checkpoint,
@@ -619,12 +665,20 @@ Examples:
                        help="Max tokens to generate per prompt")
     parser.add_argument("--temperature", type=float, default=0.7)
     parser.add_argument("--top_p", type=float, default=0.9)
+    parser.add_argument("--quantization", default="none", choices=["4bit", "8bit", "none"],
+                       help="Quantization for target model (must match feature extraction)")
     parser.add_argument("--baseline", action="store_true", default=True,
                        help="Also evaluate baseline (no drafter)")
     parser.add_argument("--output", default="eval_results.json",
                        help="Output file for results")
 
     args = parser.parse_args()
+
+    # Load tokenizer for text equivalence analysis
+    HF_TOKEN = os.getenv("HUGGINGFACE_TOKEN") or os.getenv("HF_TOKEN")
+    tokenizer = AutoTokenizer.from_pretrained(args.target_model, token=HF_TOKEN)
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
 
     # Load prompts
     if args.test_prompts:
@@ -653,7 +707,8 @@ Examples:
         print("STEP 1: Baseline Evaluation")
         print("="*70)
         baseline_results = evaluate_baseline(args.target_model, prompts, args.max_tokens,
-                                            args.temperature, args.top_p)
+                                            args.temperature, args.top_p,
+                                            quantization=args.quantization)
         results["baseline"] = baseline_results
         baseline_tokens = baseline_results.get("_raw_tokens", [])
         baseline_tps = baseline_results["mean_tps"]
@@ -664,7 +719,8 @@ Examples:
     print("STEP 2: Speculative Decoding Evaluation")
     print("="*70)
     drafter_results = evaluate_speculative(args.drafter_checkpoint, args.target_model,
-                                          prompts, args.max_tokens, args.temperature, args.top_p)
+                                          prompts, args.max_tokens, args.temperature, args.top_p,
+                                          quantization=args.quantization)
     results["drafter"] = drafter_results
     drafter_tokens = drafter_results.get("_raw_tokens", [])
     drafter_tps = drafter_results["mean_tps"]

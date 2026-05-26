@@ -31,6 +31,15 @@ from bitsandbytes.optim import PagedAdamW8bit
 from tqdm import tqdm
 import numpy as np
 
+# Weights & Biases
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
+import wandb
+WANDB_AVAILABLE = bool(os.getenv("WANDB_API_KEY"))
+
 
 class _BrokenPipeSuppressor:
     """Context manager to suppress BrokenPipeError and handle SIGPIPE.
@@ -746,13 +755,13 @@ class EagleTrainer:
         speculation_depth: int = 4,
         use_lora: bool = True,
         lora_rank: int = 64,
-        lora_alpha: int = 128,
-        learning_rate: float = 1e-4,
-        batch_size: int = 4,
+        lora_alpha: int = 256,
+        learning_rate: float = 4e-5,
+        batch_size: int = 2,
         num_epochs: int = 3,
-        warmup_steps: int = 100,
+        warmup_steps: int = 150,
         max_grad_norm: float = 1.0,
-        save_every: int = 1000,
+        save_every: int = 100,
         device: str = "cuda",
         skip_hardware_check: bool = False,
         yes: bool = False,
@@ -762,16 +771,16 @@ class EagleTrainer:
         log_dir: str = None,
         gpu_safety_margin_gb: float = 1.5,
         resume_from: str = None,
-        gradient_accumulation_steps: int = 1,
-        max_seq_len: int = 2048,
+        gradient_accumulation_steps: int = 32,
+        max_seq_len: int = 32768,
         rank: int = 0,
         world_size: int = 1,
         deepspeed_config: str = None,
         use_flash_attention: bool = True,
-        # Regularization parameters
         label_smoothing: float = 0.0,
         mtp_dropout: float = 0.1,
         weight_decay: float = 0.01,
+        shard_cache_size: int = 2,
     ):
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
@@ -829,12 +838,13 @@ class EagleTrainer:
             use_lora=use_lora,
             lora_rank=lora_rank,
             lora_alpha=lora_alpha,
+            lora_dropout=mtp_dropout,  # Use mtp_dropout for LoRA too
             device=device,
-            use_hidden_injection=True,   # CRITICAL: EAGLE-3 needs target hidden state injection
-            injection_mode="concat",     # CONCATENATION: first layer gets 2x hidden size input
+            use_hidden_injection=True,
+            injection_mode="concat",
             quantization=quantization,
             use_flash_attention=use_flash_attention,
-            mtp_dropout=mtp_dropout,     # Dropout for regularization
+            mtp_dropout=mtp_dropout,
         )
 
         # Wrap model with DDP if using multiple GPUs (but NOT if using DeepSpeed)
@@ -971,7 +981,7 @@ class EagleTrainer:
             tokenizer=self.tokenizer,
             speculation_depth=speculation_depth,
             max_seq_len=max_seq_len,
-            shard_cache_size=1  # Keep only 1 shard in RAM at a time
+            shard_cache_size=shard_cache_size
         )
 
         # Split into train/val (95/5 split like official EAGLE)
@@ -1006,15 +1016,16 @@ class EagleTrainer:
             self.val_sampler = None
 
         # Create dataloaders
-        # Note: pin_memory=False because we move tensors to device in training loop
+        # NOTE: num_workers=0 is REQUIRED for lazy loading to work correctly
+        # The dataset loads shards on-demand in __getitem__, which is not thread-safe
         self.train_loader = DataLoader(
             self.train_subset,
             batch_size=batch_size,
-            shuffle=(self.train_sampler is None),  # Shuffle only if no sampler
+            shuffle=False,  # Dataset already orders by shard for cache efficiency
             sampler=self.train_sampler,
             collate_fn=self._collate_fn,
-            num_workers=0,  # Must be 0 for lazy loading to work correctly
-            pin_memory=False
+            num_workers=0,  # Must be 0 for lazy loading compatibility
+            pin_memory=False  # Not needed when num_workers=0
         )
 
         self.val_loader = DataLoader(
@@ -1042,6 +1053,34 @@ class EagleTrainer:
         log_path = Path(log_dir) if log_dir else self.output_dir / "logs"
         self.writer = SummaryWriter(log_dir=log_path)
         self.metrics_tracker = MetricsTracker()
+
+        # Weights & Biases
+        self.wandb_enabled = WANDB_AVAILABLE and self.is_main_process
+        if self.wandb_enabled:
+            run_name = f"peagle_drafter_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+            wandb.init(
+                project="P-EAGLE",
+                name=run_name,
+                config={
+                    "drafter_model": drafter_model_name,
+                    "target_hidden_dim": target_hidden_dim,
+                    "speculation_depth": speculation_depth,
+                    "batch_size": batch_size,
+                    "num_epochs": num_epochs,
+                    "learning_rate": learning_rate,
+                    "lora_rank": lora_rank,
+                    "lora_alpha": lora_alpha,
+                    "max_seq_len": max_seq_len,
+                    "gradient_accumulation_steps": gradient_accumulation_steps,
+                    "use_lora": use_lora,
+                    "use_flash_attention": use_flash_attention,
+                    "label_smoothing": label_smoothing,
+                    "mtp_dropout": mtp_dropout,
+                    "weight_decay": weight_decay,
+                },
+                dir=str(self.output_dir),
+            )
+            self.logger.info(f"W&B initialized: {wandb.run.url if hasattr(wandb.run, 'url') else 'offline'}")
 
         print(f"Training setup complete:")
         print(f"  Total samples: {total_samples}")
@@ -1281,12 +1320,15 @@ class EagleTrainer:
         print("\n🚀 Starting training...\n")
 
     def _collate_fn(self, batch: List[Dict]) -> Dict[str, torch.Tensor]:
-        """Collate function for batching. Returns CPU tensors."""
-        # CRITICAL FIX: Ensure pad_token_id is valid before using
+        """Collate function for batching. Returns CPU tensors.
+        Pads to multiple of 8 for tensor core efficiency.
+        """
         pad_token_id = self.tokenizer.pad_token_id
         if pad_token_id is None:
-            pad_token_id = 0  # Safe fallback
+            pad_token_id = 0
             print(f"WARNING: pad_token_id is None, using fallback value 0")
+
+        pad_multiple = 8
 
         input_ids = nn.utils.rnn.pad_sequence(
             [b["input_ids"] for b in batch],
@@ -1309,30 +1351,37 @@ class EagleTrainer:
             padding_value=0
         )
 
-        # FIX: Include target_token_ids to use precomputed ground-truth targets
-        # instead of computing them dynamically from normalized hidden states
+        # Pad to multiple of 8 for tensor core efficiency
+        current_len = input_ids.shape[1]
+        pad_len = (pad_multiple - current_len % pad_multiple) % pad_multiple
+        if pad_len > 0:
+            input_ids = torch.nn.functional.pad(input_ids, (0, pad_len), value=pad_token_id)
+            target_hidden = torch.nn.functional.pad(target_hidden, (0, 0, 0, pad_len), value=0.0)
+            loss_mask = torch.nn.functional.pad(loss_mask, (0, pad_len), value=0)
+            attention_mask = torch.nn.functional.pad(attention_mask, (0, pad_len), value=0)
+
         target_token_ids_list = []
         for b in batch:
             ttids = b.get("target_token_ids", None)
             if ttids is not None:
                 target_token_ids_list.append(ttids)
             else:
-                # Fallback: create a dummy tensor with -100 (ignore index)
                 target_token_ids_list.append(torch.full((1,), -100, dtype=torch.long))
 
         target_token_ids = nn.utils.rnn.pad_sequence(
             target_token_ids_list,
             batch_first=True,
-            padding_value=-100  # Use -100 as ignore index for cross_entropy
+            padding_value=-100
         )
+        if pad_len > 0:
+            target_token_ids = torch.nn.functional.pad(target_token_ids, (0, pad_len), value=-100)
 
-        # Return CPU tensors - moved to device in training loop
         return {
             "input_ids": input_ids,
             "target_hidden": target_hidden,
             "loss_mask": loss_mask,
             "attention_mask": attention_mask,
-            "target_token_ids": target_token_ids  # Precomputed ground-truth targets
+            "target_token_ids": target_token_ids
         }
 
     @torch.no_grad()
@@ -1392,7 +1441,9 @@ class EagleTrainer:
                 mask_trimmed = loss_mask[:, shift:shift + min_len]
 
                 # FIX: Use precomputed target_token_ids, properly shifted for MTP
-                target_ids_shifted = target_token_ids[:, shift:shift + min_len]
+                # target_token_ids[t] = model's argmax predicting token at position t+1
+                # MTP head i predicts position t+i+1 → targets at index t+i = target_token_ids[i:]
+                target_ids_shifted = target_token_ids[:, i:i + min_len]
 
                 # Use SAME loss function as training for consistency
                 ce_loss_k, mse_loss_k, _ = hidden_state_token_loss(
@@ -1645,16 +1696,22 @@ class EagleTrainer:
                     if self.is_main_process:
                         self.logger.warning("Progress bar output stopped (pipe closed). Continuing training...")
 
-                # Log to TensorBoard
+                # Log to TensorBoard & W&B
                 if self.global_step % 10 == 0:
-                    self.writer.add_scalar("train/total_loss", avg_loss, self.global_step)
-                    self.writer.add_scalar("train/lr", self.scheduler.get_last_lr()[0], self.global_step)
-                    self.writer.add_scalar("train/mtp_loss_avg", avg_metrics.get("mtp_loss_avg", 0), self.global_step)
-                    self.writer.add_scalar("train/ce_loss_avg", avg_metrics.get("ce_loss_avg", 0), self.global_step)
-                    self.writer.add_scalar("train/token_acc_avg", avg_metrics.get("token_acc_avg", 0), self.global_step)
+                    log_data = {
+                        "train/total_loss": avg_loss,
+                        "train/lr": self.scheduler.get_last_lr()[0],
+                        "train/mtp_loss_avg": avg_metrics.get("mtp_loss_avg", 0),
+                        "train/ce_loss_avg": avg_metrics.get("ce_loss_avg", 0),
+                        "train/token_acc_avg": avg_metrics.get("token_acc_avg", 0),
+                    }
                     for k, v in avg_metrics.items():
                         if k.startswith("mtp_loss_") or k.startswith("token_acc_"):
-                            self.writer.add_scalar(f"train/{k}", v, self.global_step)
+                            log_data[f"train/{k}"] = v
+                    for k, v in log_data.items():
+                        self.writer.add_scalar(k, v, self.global_step)
+                    if self.wandb_enabled:
+                        wandb.log(log_data, step=self.global_step)
 
                 # Save checkpoint
                 if self.global_step % self.save_every == 0:
@@ -1703,10 +1760,18 @@ class EagleTrainer:
 
             epoch_stats.append(epoch_stat)
 
-            # Log to TensorBoard
+            # Log to TensorBoard & W&B
             self.writer.add_scalar("epoch/train_loss", avg_train_loss, epoch + 1)
             if val_loss is not None:
                 self.writer.add_scalar("epoch/val_loss", val_loss, epoch + 1)
+            if self.wandb_enabled:
+                epoch_wandb = {"epoch/train_loss": avg_train_loss}
+                if val_loss is not None:
+                    epoch_wandb["epoch/val_loss"] = val_loss
+                for i in range(self.speculation_depth):
+                    if epoch_mtp_losses[i]:
+                        epoch_wandb[f"epoch/mtp_head_{i+1}"] = np.mean(epoch_mtp_losses[i])
+                wandb.log(epoch_wandb, step=epoch + 1)
 
             self.logger.info(f"Epoch {epoch + 1} summary:")
             self.logger.info(f"  Train loss: {avg_train_loss:.6f} (CE: {avg_ce_loss:.6f}, MSE: {avg_mse_loss:.6f})")
@@ -1748,6 +1813,10 @@ class EagleTrainer:
                     self.logger.warning(f"  Early stopping triggered (patience={patience})")
                     break
 
+            # Save epoch checkpoint for resume capability
+            self._save_checkpoint(f"epoch_{epoch+1}_checkpoint")
+            self.logger.info(f"  Epoch {epoch+1} checkpoint saved")
+
         # Save training history
         history_path = self.output_dir / "training_history.json"
 
@@ -1776,6 +1845,8 @@ class EagleTrainer:
         self.gpu_monitor.log_memory_summary()
 
         self.writer.close()
+        if self.wandb_enabled:
+            wandb.finish()
         self.logger.info("\nTraining complete!")
 
     def _get_active_heads(self, epoch: int) -> int:
@@ -1900,52 +1971,49 @@ class EagleTrainer:
                     target_trimmed = target_shifted[:, :min_len]
                     mask_trimmed = mask_shifted[:, :min_len]
 
-                    # FIX: Use precomputed target_token_ids, properly shifted for MTP
-                    # This ensures we use the ground-truth token targets from the model's
-                    # actual logits, not computed from normalized hidden states
-                    target_ids_shifted = target_token_ids[:, shift:shift + min_len]
+                # FIX: Use precomputed target_token_ids, properly shifted for MTP
+                # target_token_ids[t] = model's argmax predicting token at position t+1
+                # MTP head k predicts position t+k+1 → targets at index t+k = target_token_ids[k:]
+                target_ids_shifted = target_token_ids[:, k:k + min_len]
 
-                    # Skip if mask is all zeros (no learning signal)
-                    if mask_trimmed.sum() == 0:
-                        continue
+                # Skip if mask is all zeros (no learning signal)
+                if mask_trimmed.sum() == 0:
+                    continue
 
-                    # P-EAGLE aligned loss: match token distributions via target lm_head
-                    # Uses cross-entropy on hard targets for stable gradients
-                    ce_loss_k, mse_loss_k, acc_k = hidden_state_token_loss(
-                        pred_trimmed,
-                        target_trimmed,
-                        self.target_lm_head,
-                        mask_trimmed,
-                        temperature=1.0,
-                        ce_weight=1.0,
-                        mse_weight=0.1,
-                        target_token_ids=target_ids_shifted,  # Precomputed ground-truth targets
-                        label_smoothing=self.label_smoothing
-                    )
+                # P-EAGLE aligned loss: match token distributions via target lm_head
+                ce_loss_k, mse_loss_k, acc_k = hidden_state_token_loss(
+                    pred_trimmed,
+                    target_trimmed,
+                    self.target_lm_head,
+                    mask_trimmed,
+                    temperature=1.0,
+                    ce_weight=0.7,
+                    mse_weight=0.3,
+                    target_token_ids=target_ids_shifted,
+                    label_smoothing=self.label_smoothing
+                )
 
-                    ce_losses.append(ce_loss_k)
-                    mse_losses.append(mse_loss_k)
-                    token_accs.append(acc_k.item())
-                    # Store raw MSE for reporting (not scaled)
-                    mtp_losses.append(mse_loss_k.item())
+                ce_losses.append(ce_loss_k)
+                mse_losses.append(mse_loss_k)
+                token_accs.append(acc_k.item())
+                # Store raw MSE for reporting (not scaled)
+                mtp_losses.append(mse_loss_k.item())
 
         # Combine losses: Cross-Entropy (token matching) + MSE (hidden state)
         # CE ensures tokens match, MSE ensures hidden states are structurally similar
         total_loss = torch.tensor(0.0, device=self.device)
 
         if ce_losses:
-            # Weight later heads less - they depend on earlier heads being accurate
             weighted_ce = []
             for i, ce in enumerate(ce_losses):
-                # Head 1: 1.0, Head 2: 0.9, Head 3: 0.8, etc.
                 weight = max(0.5, 1.0 - i * 0.1)
                 weighted_ce.append(ce * weight)
             ce_total = sum(weighted_ce) / sum(max(0.5, 1.0 - i * 0.1) for i in range(len(weighted_ce)))
-            total_loss = total_loss + ce_total  # Primary: token matching
+            total_loss = total_loss + ce_total
 
         if mse_losses:
             mse_total = sum(mse_losses) / len(mse_losses)
-            total_loss = total_loss + 0.1 * mse_total  # Secondary: hidden state similarity
+            total_loss = total_loss + mse_total
 
         # --- LOSS SCALING ---
         # CE loss is already properly scaled in hidden_state_token_loss.
@@ -2001,8 +2069,12 @@ class EagleTrainer:
                         lora_grad_norm += param.grad.norm().item() ** 2
             if mtp_grad_norm > 0:
                 self.writer.add_scalar("gradients/mtp_norm", mtp_grad_norm ** 0.5, self.global_step)
+                if self.wandb_enabled:
+                    wandb.log({"gradients/mtp_norm": mtp_grad_norm ** 0.5}, step=self.global_step)
             if lora_grad_norm > 0:
                 self.writer.add_scalar("gradients/lora_norm", lora_grad_norm ** 0.5, self.global_step)
+                if self.wandb_enabled:
+                    wandb.log({"gradients/lora_norm": lora_grad_norm ** 0.5}, step=self.global_step)
 
         # Gradient clipping per parameter group
         # MTP heads (10x LR): allow larger gradients since they learn faster
@@ -2068,13 +2140,15 @@ def main():
     parser.add_argument("--output_dir", default="./checkpoints")
     parser.add_argument("--use_lora", action="store_true", default=False)
     parser.add_argument("--lora_rank", type=int, default=64)
-    parser.add_argument("--lora_alpha", type=int, default=128,
-                        help="LoRA alpha scaling factor (default: 128)")
-    parser.add_argument("--batch_size", type=int, default=4)
+    parser.add_argument("--lora_alpha", type=int, default=256,
+                        help="LoRA alpha scaling factor (default: 256)")
+    parser.add_argument("--lora_dropout", type=float, default=0.05,
+                        help="LoRA dropout rate (default: 0.05)")
+    parser.add_argument("--batch_size", type=int, default=2)
     parser.add_argument("--num_epochs", type=int, default=3)
-    parser.add_argument("--learning_rate", type=float, default=2e-5,
-                        help="Learning rate (default: 2e-5 for small datasets)")
-    parser.add_argument("--warmup_steps", type=int, default=100)
+    parser.add_argument("--learning_rate", type=float, default=4e-5,
+                        help="Learning rate (default: 4e-5)")
+    parser.add_argument("--warmup_steps", type=int, default=150)
     parser.add_argument("--skip-hardware-check", action="store_true",
                         help="Skip GPU/disk requirements check")
     parser.add_argument("--skip-security-check", action="store_true",
@@ -2093,10 +2167,10 @@ def main():
                         help="Skip confirmation prompt and start training immediately")
     parser.add_argument("--resume", type=str, default=None,
                         help="Resume training from checkpoint directory (e.g., checkpoints_peagle_v2/checkpoint_step_1000)")
-    parser.add_argument("--gradient_accumulation_steps", type=int, default=1,
-                        help="Number of steps to accumulate gradients before updating weights. Larger values = less memory but slower training (default: 1)")
-    parser.add_argument("--max_seq_len", type=int, default=2048,
-                        help="Maximum sequence length for training. Reduce to 1024 to save VRAM on memory-constrained systems (default: 2048)")
+    parser.add_argument("--gradient_accumulation_steps", type=int, default=32,
+                        help="Number of steps to accumulate gradients before updating weights. Larger values = less memory but slower training (default: 32)")
+    parser.add_argument("--max_seq_len", type=int, default=32768,
+                        help="Maximum sequence length for training (default: 32768 — Gemma-3-270M-it native limit)")
     parser.add_argument("--deepspeed", type=str, default=None,
                         help="Path to DeepSpeed config JSON file for ZeRO optimization")
     parser.add_argument("--use_flash_attention", action="store_true", dest="use_flash_attention",
@@ -2112,6 +2186,10 @@ def main():
                         help="Dropout rate in MTP heads (default: 0.1)")
     parser.add_argument("--weight_decay", type=float, default=0.01,
                         help="Weight decay for optimizer (default: 0.01)")
+    parser.add_argument("--shard_cache_size", type=int, default=2,
+                        help="Number of feature shards to cache in RAM (default: 2, each shard is ~17GB)")
+    parser.add_argument("--save_every", type=int, default=100,
+                        help="Save checkpoint every N steps (default: 100)")
 
     args = parser.parse_args()
 
@@ -2192,6 +2270,8 @@ def main():
         label_smoothing=args.label_smoothing,
         mtp_dropout=args.mtp_dropout,
         weight_decay=args.weight_decay,
+        save_every=args.save_every,
+        shard_cache_size=args.shard_cache_size,
     )
 
     try:

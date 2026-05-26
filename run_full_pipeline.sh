@@ -48,15 +48,16 @@ DRAFTER_MODEL="${DRAFTER_MODEL:-google/gemma-3-270m-it}"
 TARGET_HIDDEN_DIM="${TARGET_HIDDEN_DIM:-2560}"   # gemma-3-4b: 2560
 DRAFTER_HIDDEN_DIM="${DRAFTER_HIDDEN_DIM:-640}"  # gemma-3-270m: 640
 
-# Training parameters (updated to proven working values)
-SPECULATION_DEPTH="${SPECULATION_DEPTH:-1}"       # Reduced to 1 for stability
+# Training parameters (optimized for quality and stability)
+SPECULATION_DEPTH="${SPECULATION_DEPTH:-4}"       # 4 MTP heads for better speculation
 NUM_SAMPLES="${NUM_SAMPLES:-2000}"                # Synthetic data samples (if generating)
 BATCH_SIZE="${BATCH_SIZE:-4}"
-EPOCHS="${EPOCHS:-1}"                             # Single epoch for quick iteration
-LEARNING_RATE="${LEARNING_RATE:-2e-5}"
+EPOCHS="${EPOCHS:-3}"                             # Full training
+LEARNING_RATE="${LEARNING_RATE:-5e-5}"            # Optimal for LoRA
 WARMUP_STEPS="${WARMUP_STEPS:-100}"
-LORA_RANK="${LORA_RANK:-16}"                      # Lower rank for faster training
-LORA_ALPHA="${LORA_ALPHA:-32}"                    # Typical: 2x rank
+LORA_RANK="${LORA_RANK:-32}"                      # Higher rank for better quality
+LORA_ALPHA="${LORA_ALPHA:-128}"                   # 4x rank for better scaling
+GRADIENT_ACCUMULATION="${GRADIENT_ACCUMULATION:-8}"  # Better GPU utilization
 QUANTIZATION="${QUANTIZATION:-}"                  # Empty = no quantization (avoids NaN issues)
 USE_LORA="${USE_LORA:-true}"
 USE_FLASH_ATTENTION="${USE_FLASH_ATTENTION:-true}"
@@ -147,6 +148,8 @@ while [[ $# -gt 0 ]]; do
             EPOCHS="$2"; shift 2 ;;
         --batch-size)
             BATCH_SIZE="$2"; shift 2 ;;
+        --gradient-accumulation)
+            GRADIENT_ACCUMULATION="$2"; shift 2 ;;
         --learning-rate)
             LEARNING_RATE="$2"; shift 2 ;;
         --warmup-steps)
@@ -184,12 +187,13 @@ Model Selection:
   --target-hidden-dim N      Target hidden dimension (default: 2560)
 
 Training Parameters:
-  --speculation-depth K      Number of MTP heads (default: 1)
-  --lora-rank R              LoRA rank (default: 16)
-  --lora-alpha A             LoRA alpha scaling (default: 32)
-  --epochs N                 Training epochs (default: 1)
+  --speculation-depth K      Number of MTP heads (default: 4)
+  --lora-rank R              LoRA rank (default: 32)
+  --lora-alpha A             LoRA alpha scaling (default: 128)
+  --epochs N                 Training epochs (default: 3)
   --batch-size N             Batch size (default: 4)
-  --learning-rate LR         Learning rate (default: 2e-5)
+  --gradient-accumulation N  Gradient accumulation steps (default: 8)
+  --learning-rate LR         Learning rate (default: 5e-5)
   --warmup-steps N           Warmup steps (default: 100)
 
 Feature Extraction:
@@ -206,8 +210,8 @@ Stage Control:
 
 Environment Variables (override defaults):
   TARGET_MODEL, DRAFTER_MODEL, SPECULATION_DEPTH, LORA_RANK, LORA_ALPHA,
-  EPOCHS, BATCH_SIZE, LEARNING_RATE, WARMUP_STEPS, FEAT_SHARD_SIZE,
-  FEAT_MAX_LENGTH, QUANTIZATION, INPUT_JSONL
+  EPOCHS, BATCH_SIZE, GRADIENT_ACCUMULATION, LEARNING_RATE, WARMUP_STEPS,
+  FEAT_SHARD_SIZE, FEAT_MAX_LENGTH, QUANTIZATION, INPUT_JSONL
 
 Examples:
   ./run_full_pipeline.sh                                     # Single GPU
@@ -254,19 +258,20 @@ $PYTHON_CMD -c "import torch; print(f'PyTorch: {torch.__version__}'); print(f'CU
 # Print configuration
 echo ""
 echo "Configuration:"
-echo "  Target Model:   $TARGET_MODEL"
-echo "  Drafter Model:  $DRAFTER_MODEL"
-echo "  Hidden Dim:     $TARGET_HIDDEN_DIM"
-echo "  Speculation K:  $SPECULATION_DEPTH"
-echo "  Epochs:         $EPOCHS"
-echo "  Batch Size:     $BATCH_SIZE"
-echo "  Learning Rate:  $LEARNING_RATE"
-echo "  Warmup Steps:   $WARMUP_STEPS"
-echo "  LoRA Rank:      $LORA_RANK"
-echo "  LoRA Alpha:     $LORA_ALPHA"
-echo "  Quantization:   ${QUANTIZATION:-none}"
-echo "  Shard Size:     $FEAT_SHARD_SIZE"
-echo "  Max Length:     $FEAT_MAX_LENGTH"
+echo "  Target Model:          $TARGET_MODEL"
+echo "  Drafter Model:         $DRAFTER_MODEL"
+echo "  Hidden Dim:            $TARGET_HIDDEN_DIM"
+echo "  Speculation K:         $SPECULATION_DEPTH"
+echo "  Epochs:                $EPOCHS"
+echo "  Batch Size:            $BATCH_SIZE"
+echo "  Gradient Accumulation: $GRADIENT_ACCUMULATION"
+echo "  Learning Rate:        $LEARNING_RATE"
+echo "  Warmup Steps:          $WARMUP_STEPS"
+echo "  LoRA Rank:             $LORA_RANK"
+echo "  LoRA Alpha:            $LORA_ALPHA"
+echo "  Quantization:          ${QUANTIZATION:-none}"
+echo "  Shard Size:            $FEAT_SHARD_SIZE"
+echo "  Max Length:            $FEAT_MAX_LENGTH"
 echo ""
 echo "  Regularization:"
 echo "    Label Smoothing: $LABEL_SMOOTHING"
@@ -439,6 +444,7 @@ if [ "$SKIP_TRAINING" = false ]; then
         --output_dir "$CHECKPOINT_DIR"
         --num_epochs "$EPOCHS"
         --batch_size "$BATCH_SIZE"
+        --gradient_accumulation_steps "$GRADIENT_ACCUMULATION"
         --learning_rate "$LEARNING_RATE"
         --warmup_steps "$WARMUP_STEPS"
         --speculation_depth "$SPECULATION_DEPTH"
@@ -447,6 +453,7 @@ if [ "$SKIP_TRAINING" = false ]; then
         --label_smoothing "$LABEL_SMOOTHING"
         --mtp_dropout "$MTP_DROPOUT"
         --weight_decay "$WEIGHT_DECAY"
+        --save_every 250
         $TRAIN_FLAGS
         --yes
     )

@@ -78,8 +78,8 @@ def hidden_state_token_loss(
     target_lm_head: nn.Module,
     mask: torch.Tensor,
     temperature: float = 1.0,
-    ce_weight: float = 1.0,
-    mse_weight: float = 0.1,
+    ce_weight: float = 0.7,
+    mse_weight: float = 0.3,
     target_token_ids: torch.Tensor = None,
     label_smoothing: float = 0.0
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -110,7 +110,7 @@ def hidden_state_token_loss(
         mse_loss: Mean squared error between hidden states
         accuracy: Token prediction accuracy (%)
     """
-    # Guard against NaN/Inf in inputs (can come from bad features or model outputs)
+    # Guard against NaN/Inf in inputs
     if not torch.isfinite(pred_hidden).all():
         num_bad = (~torch.isfinite(pred_hidden)).sum().item()
         print(f"WARNING: {num_bad} non-finite values in pred_hidden, clamping")
@@ -119,19 +119,6 @@ def hidden_state_token_loss(
         num_bad = (~torch.isfinite(target_hidden)).sum().item()
         print(f"WARNING: {num_bad} non-finite values in target_hidden, clamping")
         target_hidden = torch.nan_to_num(target_hidden, nan=0.0, posinf=10.0, neginf=-10.0)
-
-    # FIX: Removed redundant LayerNorm that was masking genuine prediction errors.
-    # The lm_head handles scale differences internally - normalizing both predictions
-    # and targets independently made their directions appear identical even when
-    # the model's predictions weren't genuinely close to targets.
-    # Only normalize if there's an extreme scale mismatch (>10x difference in std)
-    pred_std = pred_hidden.std(dim=-1, keepdim=True).clamp(min=1e-6)
-    target_std = target_hidden.std(dim=-1, keepdim=True).clamp(min=1e-6)
-    scale_ratio = (pred_std / target_std).clamp(0.1, 10.0)
-
-    # Only apply scale correction if there's significant scale mismatch
-    if scale_ratio.mean() < 0.5 or scale_ratio.mean() > 2.0:
-        target_hidden = target_hidden * scale_ratio
 
     # Get predicted token distributions from drafter hidden states via TARGET's lm_head
     # This matches inference: drafter hidden -> target lm_head -> tokens
@@ -156,25 +143,26 @@ def hidden_state_token_loss(
     target_tokens_flat = target_tokens.reshape(-1)
     mask_flat = mask.reshape(-1)
 
-    # Compute cross-entropy loss per token (with label smoothing for regularization)
-    ce_loss_per_token = F.cross_entropy(
-        pred_logits_flat,
-        target_tokens_flat,
-        reduction='none',
-        label_smoothing=label_smoothing
-    )  # [batch * seq_len]
+    # Replace mask=0 positions with -100 so CE ignores them entirely
+    # (padding tokens already -100, system/user tokens have valid IDs but mask=0)
+    targets_masked = torch.where(mask_flat == 0, -100, target_tokens_flat)
 
-    # Apply mask and average
-    ce_loss = (ce_loss_per_token * mask_flat).sum() / (mask.sum() + 1e-8)
+    # Compute cross-entropy loss (ignore_index=-100 skips padding + masked tokens)
+    ce_loss = F.cross_entropy(
+        pred_logits_flat,
+        targets_masked,
+        ignore_index=-100,
+        label_smoothing=label_smoothing
+    )
     ce_loss = ce_loss * ce_weight
 
     # Auxiliary MSE loss for hidden state similarity (helps convergence)
     mse_loss = masked_mse_loss(pred_hidden, target_hidden, mask)
     mse_loss = mse_loss * mse_weight
 
-    # Compute token accuracy (hard metric for monitoring)
+    # Compute token accuracy (only on non-masked positions)
     pred_tokens = pred_logits.argmax(dim=-1)
     correct = (pred_tokens == target_tokens).float() * mask
-    accuracy = correct.sum() / (mask.sum() + 1e-8) * 100  # percentage
+    accuracy = correct.sum() / (mask.sum() + 1e-8) * 100
 
     return ce_loss, mse_loss, accuracy

@@ -25,7 +25,7 @@ data/
 checkpoints/
 checkpoints_peagle
 models_cache/
-output/
+outputs/
 
 # Logs
 logs/

@@ -204,15 +204,19 @@ class EagleTrainingDataset(Dataset):
         for shard_idx, pt_file in enumerate(self.shard_files):
             shard_size_gb = os.path.getsize(pt_file) / 1e9
 
-            # For large shards (>10GB), skip expensive filtering during init
-            # Filtering will be done on-the-fly during __getitem__
+            # For large shards (>10GB), use mmap to read just num_samples (fast)
             if shard_size_gb > 10:
-                print(f"  Shard {shard_idx+1}/{len(self.shard_files)}: {shard_size_gb:.1f}GB (large - using lazy loading)")
-                # Estimate sample count from file size (~30 samples per GB typical for bf16 features)
-                est_samples = int(shard_size_gb * 30)
-                self.shard_sample_counts.append(est_samples)
-                # Add all estimated indices (filtering deferred to __getitem__)
-                for local_idx in range(est_samples):
+                print(f"  Shard {shard_idx+1}/{len(self.shard_files)}: {shard_size_gb:.1f}GB (reading metadata with mmap)")
+                try:
+                    data = torch.load(pt_file, map_location="cpu", weights_only=True, mmap=True)
+                    num_samples = data["num_samples"]
+                    del data
+                except Exception:
+                    # Fallback: estimate
+                    num_samples = max(1, int(shard_size_gb * 3))
+                    print(f"  Warning: Could not read shard metadata, estimating {num_samples} samples")
+                self.shard_sample_counts.append(num_samples)
+                for local_idx in range(num_samples):
                     self.sample_index.append((shard_idx, local_idx))
             else:
                 # Small shards: can afford to load and filter
@@ -246,16 +250,34 @@ class EagleTrainingDataset(Dataset):
                     gc.collect()
                 except Exception as e:
                     print(f"  Warning: Could not filter shard {pt_file.name}: {e}")
-                    # Fallback: assume all samples valid
-                    est_samples = int(shard_size_gb * 600)
-                    self.shard_sample_counts.append(est_samples)
-                    for local_idx in range(est_samples):
+                    # Fallback: use mmap to read num_samples
+                    try:
+                        data = torch.load(pt_file, map_location="cpu", weights_only=True, mmap=True)
+                        num_samples = data["num_samples"]
+                        del data
+                    except Exception:
+                        num_samples = max(1, int(shard_size_gb * 3))
+                    self.shard_sample_counts.append(num_samples)
+                    for local_idx in range(num_samples):
                         self.sample_index.append((shard_idx, local_idx))
 
         print(f"Indexed {len(self.sample_index)} samples across {len(self.shard_files)} shards")
         if total_filtered > 0:
             print(f"  (Filtered {total_filtered} samples from small shards)")
         print(f"Note: Large shards use lazy loading - some zero-loss samples may be included")
+
+        # Group samples by shard, shuffle within each shard, then concatenate
+        # This processes one shard at a time (avoids thrashing 17GB loads)
+        # while maintaining randomness within each shard for training variance
+        import random
+        shard_groups = {}
+        for idx in self.sample_index:
+            shard_groups.setdefault(idx[0], []).append(idx)
+        for shard_idx in shard_groups:
+            random.shuffle(shard_groups[shard_idx])
+        self.sample_index = []
+        for shard_idx in sorted(shard_groups.keys()):
+            self.sample_index.extend(shard_groups[shard_idx])
 
         # Shard cache: only keep recent shards in memory
         self._shard_cache = {}  # shard_idx -> shard_data
@@ -275,7 +297,7 @@ class EagleTrainingDataset(Dataset):
 
         # Load the shard
         pt_file = self.shard_files[shard_idx]
-        data = torch.load(pt_file, map_location="cpu", weights_only=False)
+        data = torch.load(pt_file, map_location="cpu", weights_only=False, mmap=True)
 
         # Store in cache
         self._shard_cache[shard_idx] = data
@@ -318,23 +340,14 @@ class EagleTrainingDataset(Dataset):
         loss_mask_full = sample["loss_mask"]
         seq_len = len(loss_mask_full)
 
-        # FIX for buggy 2D features (missing sequence dimension)
-        # Check raw_hidden_states first, fallback to fused_hidden_states
         if "raw_hidden_states" in sample:
             raw_hidden = sample["raw_hidden_states"]
         else:
             raw_hidden = sample["fused_hidden_states"]
 
-        # If raw_hidden is 1D [hidden_dim], reshape to 2D [seq_len, hidden_dim]
-        # The sequence length comes from input_ids (stored in sample), hidden dim is the tensor's size
-        if raw_hidden.dim() == 1:
-            actual_seq_len = len(sample["input_ids"])
-            hidden_dim = raw_hidden.shape[0]
-            raw_hidden = raw_hidden.unsqueeze(0).expand(actual_seq_len, hidden_dim)
-            if "raw_hidden_states" in sample:
-                sample["raw_hidden_states"] = raw_hidden
-            else:
-                sample["fused_hidden_states"] = raw_hidden
+        assert raw_hidden.dim() == 2, \
+            f"Hidden states must be 2D [seq_len, hidden_dim], got shape {raw_hidden.shape}." \
+            f" Re-extract features with --layers last and --max_length >= 32768"
 
         if seq_len > self.max_seq_len:
             # Find the best window that maximizes mask coverage
