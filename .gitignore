@@ -25,10 +25,17 @@ data/*
 checkpoints/*
 models_cache/*
 outputs/*
-
-# Logs*
+docs/*
 logs/*
 *.log
+
+# But track the directory structure with .gitkeep
+!data/.gitkeep
+!checkpoints/.gitkeep
+!models_cache/.gitkeep
+!outputs/.gitkeep
+!docs/.gitkeep
+!logs/.gitkeep
 
 # Plots and outputs
 plot_scripts/plots/
