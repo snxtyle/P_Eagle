@@ -22,7 +22,7 @@ P-EAGLE implements the **EAGLE-3** speculative decoding algorithm that accelerat
 - 🌳 **Tree Attention**: Verifies K tokens in O(1) complexity per token
 - ⚡ **Flash Attention**: Memory-efficient attention for long contexts
 - 🔥 **Multi-GPU Training**: Distributed training across multiple GPUs
-- 📦 **Offline Sequence Packing**: Zero-padding packing for 100% GPU utilization on H100/H200 clusters
+- 📦 **Sliding Window + System Prompt Anchoring**: Professional chunking preserves tool definitions across all windows
 
 ---
 
@@ -48,22 +48,23 @@ P-EAGLE implements the **EAGLE-3** speculative decoding algorithm that accelerat
 ![P-EAGLE Workflow](docs/p-eagle-workflow.gif)
 
 ```
-📥 Raw Data → 📦 Sequence Packing → 📊 Extract Features → 🏋️ Train Drafter → 🎯 Inference/Evaluate
+📥 Raw Data → 📦 Sliding Window + System Anchor → 🔗 Block Packing → 🏋️ Train Drafter → 🎯 Inference/Evaluate
 ```
 
-### 📦 Offline Sequence Packing (H100/H200 Optimized)
-P-EAGLE uses **offline sequence packing** for maximum GPU utilization on datacenter hardware:
-- **Zero padding waste**: Pack multiple conversations into fixed-size blocks
-- **Preserves conversational integrity**: Keep full tool cycles (assistant → tool → response) intact
-- **Variable-Length FlashAttention**: Uses `cu_seqlens` for efficient cross-conversation isolation
-- **100% tensor core utilization**: No wasted cycles on padding tokens
+### 📦 Sliding Window with System Prompt Anchoring (H100/H200 Optimized)
+Professional-grade chunking for speculative training on datacenter hardware:
+- **System Prompt Anchoring**: System prompt prepended to EVERY chunk for tool definitions
+- **Context Overlap**: 50% overlap between windows preserves immediate history
+- **Zero Padding**: Block packing achieves 100% tensor core utilization
+- **Variable-Length FlashAttention**: Uses `cu_seqlens` for cross-conversation isolation
 
 ```bash
-# Pack conversations into sequence blocks
+# Prepare data for H200
 python scripts/sequence_packing.py \
-    --input_dir /tmp/conversations \
-    --output_dir data/packed_sequences \
-    --max_seq_len 4096
+    --input data/raw_conversations.jsonl \
+    --output data/packed_features \
+    --max_seq_len 4096 \
+    --tokenizer google/gemma-3-4b-it
 ```
 
 ---
@@ -77,9 +78,9 @@ pip install -r requirements.txt
 # Run full pipeline
 ./run_full_pipeline.sh
 
-# Or step by step
-python scripts/generate_data.py --local --num-samples 5000
-python scripts/sequence_packing.py --input_dir /tmp/conversations --output_dir data/packed_sequences
+# Or step by step (H200 optimized)
+python scripts/generate_data.py --output data/raw_conversations.jsonl
+python scripts/sequence_packing.py --input data/raw_conversations.jsonl --output data/packed_features
 python -m p_eagle.scripts.extract_features --model_path google/gemma-3-4b-it
 python -m p_eagle.scripts.train_drafter --drafter_model google/gemma-3-270m-it --use_lora
 python -m p_eagle.scripts.evaluate
@@ -176,7 +177,7 @@ pkill -f "p_eagle.training.trainer"
 |---------|-------------|
 | ⚡ **Fast** | 1.5-3x inference speedup with no quality loss |
 | 💾 **Efficient** | Memory-efficient with flash attention |
-| 📦 **Packed Sequences** | Zero-padding for 100% GPU utilization on H100/H200 |
+| 📦 **Professional Chunking** | Sliding window + system anchor for accurate speculation |
 | 🔧 **Flexible** | Works with any transformer-based model |
 | 📈 **Scalable** | Multi-GPU training support |
 | 🏭 **Production-Ready** | Clean API, comprehensive documentation |
@@ -186,8 +187,8 @@ pkill -f "p_eagle.training.trainer"
 ## 🎯 Getting Started
 
 1. **📦 Install**: `pip install -r requirements.txt`
-2. **📂 Prepare Data**: Generate conversation data or use existing JSON files
-3. **📦 Sequence Packing**: `python scripts/sequence_packing.py --input_dir <data> --output_dir <output>`
+2. **📂 Prepare Data**: Generate or download raw conversations in OpenAI format
+3. **📦 Apply Sliding Window**: `python scripts/sequence_packing.py --input <data> --output <output>`
 4. **📊 Extract Features**: Run feature extraction with your target model
 5. **🏋️ Train Drafter**: Train the EAGLE drafter model with LoRA
 6. **🎯 Evaluate**: Run evaluation to measure speedup and acceptance rate

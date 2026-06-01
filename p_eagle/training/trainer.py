@@ -756,10 +756,11 @@ class EagleTrainer:
         use_lora: bool = True,
         lora_rank: int = 64,
         lora_alpha: int = 256,
-        learning_rate: float = 4e-5,
+        learning_rate: float = 5e-5,
         batch_size: int = 2,
         num_epochs: int = 3,
-        warmup_steps: int = 150,
+        warmup_steps: int = None,
+        warmup_ratio: float = 0.03,
         max_grad_norm: float = 1.0,
         save_every: int = 100,
         device: str = "cuda",
@@ -1056,10 +1057,18 @@ class EagleTrainer:
 
         # Setup scheduler
         total_steps = len(self.train_loader) * num_epochs
-        self.warmup_steps = warmup_steps
+        # Calculate warmup_steps from ratio if not explicitly specified
+        if warmup_steps is None:
+            self.warmup_steps = int(warmup_ratio * total_steps)
+            if self.is_main_process:
+                self.logger.info(f"Warmup: {self.warmup_steps} steps ({warmup_ratio:.1%} of {total_steps} total steps)")
+        else:
+            self.warmup_steps = warmup_steps
+            if self.is_main_process:
+                self.logger.info(f"Warmup: {self.warmup_steps} steps (fixed)")
         self.scheduler = get_cosine_schedule_with_warmup(
             self.optimizer,
-            num_warmup_steps=warmup_steps,
+            num_warmup_steps=self.warmup_steps,
             num_training_steps=total_steps
         )
 
@@ -2266,9 +2275,13 @@ def main():
                         help="LoRA dropout rate (default: 0.05)")
     parser.add_argument("--batch_size", type=int, default=2)
     parser.add_argument("--num_epochs", type=int, default=3)
-    parser.add_argument("--learning_rate", type=float, default=4e-5,
-                        help="Learning rate (default: 4e-5)")
-    parser.add_argument("--warmup_steps", type=int, default=150)
+    parser.add_argument("--learning_rate", type=float, default=5e-5,
+                        help="Learning rate (default: 5e-5 for H200, 4e-5 for older GPUs)")
+    parser.add_argument("--warmup_steps", type=int, default=None,
+                        help="Number of warmup steps (if warmup_ratio not specified)")
+    parser.add_argument("--warmup_ratio", type=float, default=0.03,
+                        help="Warmup ratio as fraction of total steps (default: 0.03 = 3%%). "
+                             "Overridden by --warmup_steps if both specified.")
     parser.add_argument("--skip-hardware-check", action="store_true",
                         help="Skip GPU/disk requirements check")
     parser.add_argument("--skip-security-check", action="store_true",
@@ -2372,6 +2385,7 @@ def main():
         batch_size=args.batch_size,
         num_epochs=args.num_epochs,
         warmup_steps=args.warmup_steps,
+        warmup_ratio=args.warmup_ratio,
         skip_hardware_check=args.skip_hardware_check,
         yes=args.yes,
         quantization=args.quantization,
