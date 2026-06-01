@@ -1,6 +1,6 @@
 # P-EAGLE
 
-**Parallel Speculative Decoding Framework for LLM Inference**
+### ⚡ Parallel Speculative Decoding Framework for LLM Inference
 
 [![Python](https://img.shields.io/badge/Python-3.10+-blue.svg)](https://python.org)
 [![PyTorch](https://img.shields.io/badge/PyTorch-2.0+-red.svg)](https://pytorch.org)
@@ -10,49 +10,65 @@
 [![LoRA](https://img.shields.io/badge/LoRA-Supported-green.svg)](https://arxiv.org/abs/2106.09685)
 [![License](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 
-**P-EAGLE** (Parallel EAGLE) achieves 1.5-3x inference speedup by predicting multiple future tokens in parallel using speculative decoding with EAGLE-3 architecture.
+**P-EAGLE** 🚀 achieves **1.5-3x inference speedup** by predicting multiple future tokens in parallel using speculative decoding with EAGLE-3 architecture.
 
-## What is P-EAGLE?
+## 📖 What is P-EAGLE?
 
-P-EAGLE implements the EAGLE-3 speculative decoding algorithm that accelerates large language model inference without quality loss. Unlike traditional autoregressive decoding (token-by-token), P-EAGLE uses a lightweight "drafter" model to predict K tokens in parallel, then verifies them all in a single pass through the target model using tree attention.
+P-EAGLE implements the **EAGLE-3** speculative decoding algorithm that accelerates large language model inference **without quality loss**. Unlike traditional autoregressive decoding (token-by-token), P-EAGLE uses a lightweight "drafter" model to predict K tokens in parallel, then verifies them all in a single pass through the target model using tree attention.
 
-**Key Innovations:**
-- **EAGLE-3 Hidden State Injection**: Combines target model embeddings with hidden states for accurate draft prediction
-- **Multi-Token Prediction**: K parallel heads predict multiple future tokens simultaneously
-- **Tree Attention**: Verifies K tokens in O(1) complexity per token
-- **Flash Attention**: Memory-efficient attention for long contexts
-- **Multi-GPU Training**: Distributed training across multiple GPUs
+**✨ Key Innovations:**
+- 🔮 **EAGLE-3 Hidden State Injection**: Combines target model embeddings with hidden states for accurate draft prediction
+- 🎯 **Multi-Token Prediction**: K parallel heads predict multiple future tokens simultaneously
+- 🌳 **Tree Attention**: Verifies K tokens in O(1) complexity per token
+- ⚡ **Flash Attention**: Memory-efficient attention for long contexts
+- 🔥 **Multi-GPU Training**: Distributed training across multiple GPUs
+- 📦 **Offline Sequence Packing**: Zero-padding packing for 100% GPU utilization on H100/H200 clusters
 
 ---
 
-## Architecture
+## 🏗️ Architecture
 
 ![P-EAGLE Architecture](docs/p-eagle-architecture.gif)
 
-**How Speculative Decoding Works:**
+**🔄 How Speculative Decoding Works:**
 
 | Step | Component | Description |
 |------|-----------|-------------|
-| 1 | Target Model | Provides hidden states from forward pass |
-| 2 | Feature Extractor | Extracts and fuses hidden states from last N layers |
-| 3 | EAGLE-3 Injection | Concatenates `[embeddings ⊕ hidden]` for drafter input |
-| 4 | Drafter Model | Generates K tokens in parallel with MTP heads |
-| 5 | Tree Attention | Verifies all K tokens in one target model pass |
-| 6 | Accept/Reject | Accepted tokens used, rejected tokens resampled |
+| 1️⃣ | Target Model | Provides hidden states from forward pass |
+| 2️⃣ | Feature Extractor | Extracts and fuses hidden states from last N layers |
+| 3️⃣ | EAGLE-3 Injection | Concatenates `[embeddings ⊕ hidden]` for drafter input |
+| 4️⃣ | Drafter Model | Generates K tokens in parallel with MTP heads |
+| 5️⃣ | Tree Attention | Verifies all K tokens in one target model pass |
+| 6️⃣ | Accept/Reject | Accepted tokens used, rejected tokens resampled |
 
 ---
 
-## Data Pipeline
+## 🔄 Data Pipeline
 
 ![P-EAGLE Workflow](docs/p-eagle-workflow.gif)
 
 ```
-Raw Data → Process → Extract Features → Train Drafter → Inference/Evaluate
+📥 Raw Data → 📦 Sequence Packing → 📊 Extract Features → 🏋️ Train Drafter → 🎯 Inference/Evaluate
+```
+
+### 📦 Offline Sequence Packing (H100/H200 Optimized)
+P-EAGLE uses **offline sequence packing** for maximum GPU utilization on datacenter hardware:
+- **Zero padding waste**: Pack multiple conversations into fixed-size blocks
+- **Preserves conversational integrity**: Keep full tool cycles (assistant → tool → response) intact
+- **Variable-Length FlashAttention**: Uses `cu_seqlens` for efficient cross-conversation isolation
+- **100% tensor core utilization**: No wasted cycles on padding tokens
+
+```bash
+# Pack conversations into sequence blocks
+python scripts/sequence_packing.py \
+    --input_dir /tmp/conversations \
+    --output_dir data/packed_sequences \
+    --max_seq_len 4096
 ```
 
 ---
 
-## Quick Start
+## 🚀 Quick Start
 
 ```bash
 # Install dependencies
@@ -63,6 +79,7 @@ pip install -r requirements.txt
 
 # Or step by step
 python scripts/generate_data.py --local --num-samples 5000
+python scripts/sequence_packing.py --input_dir /tmp/conversations --output_dir data/packed_sequences
 python -m p_eagle.scripts.extract_features --model_path google/gemma-3-4b-it
 python -m p_eagle.scripts.train_drafter --drafter_model google/gemma-3-270m-it --use_lora
 python -m p_eagle.scripts.evaluate
@@ -70,7 +87,7 @@ python -m p_eagle.scripts.evaluate
 
 ---
 
-## Usage Example
+## 💻 Usage Example
 
 ```python
 from p_eagle.inference import PEAGLEInference
@@ -88,7 +105,7 @@ print(f"Acceptance rate: {result.acceptance_rate:.1%}")
 
 ---
 
-## Configuration
+## ⚙️ Configuration
 
 | Parameter | Value Used | Description |
 |-----------|-----------|-------------|
@@ -106,7 +123,7 @@ print(f"Acceptance rate: {result.acceptance_rate:.1%}")
 | `use_flash_attention` | true | Enable flash attention |
 | `save_every` | 10 | Save checkpoint every N steps |
 
-**Example Training Command:**
+**📝 Example Training Command:**
 ```bash
 pkill -f "p_eagle.training.trainer"
 
@@ -131,45 +148,60 @@ pkill -f "p_eagle.training.trainer"
 
 ---
 
-## Hardware Requirements
+## 💻 Hardware Requirements
 
 | Drafter Size | GPU Memory | Training Time (7k samples) |
 |--------------|------------|---------------------------|
 | 270M | 12 GB | ~2-3 hours/epoch |
 | 1B | 20 GB | ~4-6 hours/epoch |
 
-**Recommended:** NVIDIA A100/H100 (40-80GB) or RTX 4090 (24GB)
+**🎮 Recommended:** NVIDIA A100/H100 (40-80GB) or RTX 4090 (24GB)
 
 ---
 
-## Performance Summary
+## 📊 Performance Summary
 
 | Metric | Value | Description |
 |--------|-------|-------------|
-| Speedup | 1.5-3x | Tokens/second vs autoregressive baseline |
-| Acceptance Rate | >70% | Draft tokens accepted by target model |
-| Memory Overhead | +270MB | Drafter model + KV cache |
-| Output Quality | Identical | Probabilistically same as target |
+| ⚡ Speedup | 1.5-3x | Tokens/second vs autoregressive baseline |
+| ✅ Acceptance Rate | >70% | Draft tokens accepted by target model |
+| 💾 Memory Overhead | +270MB | Drafter model + KV cache |
+| 🎯 Output Quality | Identical | Probabilistically same as target |
 
-## Why P-EAGLE?
+---
 
-- **Fast**: 1.5-3x inference speedup with no quality loss
-- **Efficient**: Memory-efficient with flash attention
-- **Flexible**: Works with any transformer-based model
-- **Scalable**: Multi-GPU training support
-- **Production-Ready**: Clean API, comprehensive documentation
+## ❓ Why P-EAGLE?
 
-## Getting Started
+| Feature | Description |
+|---------|-------------|
+| ⚡ **Fast** | 1.5-3x inference speedup with no quality loss |
+| 💾 **Efficient** | Memory-efficient with flash attention |
+| 📦 **Packed Sequences** | Zero-padding for 100% GPU utilization on H100/H200 |
+| 🔧 **Flexible** | Works with any transformer-based model |
+| 📈 **Scalable** | Multi-GPU training support |
+| 🏭 **Production-Ready** | Clean API, comprehensive documentation |
 
-1. **Install**: `pip install -r requirements.txt`
-2. **Run Pipeline**: `./run_full_pipeline.sh`
-3. **Customize**: Adjust `speculation_depth`, `lora_rank`, `max_seq_len` as needed
+---
 
-## Contributing
+## 🎯 Getting Started
 
-Contributions are welcome! Please open an issue or submit a pull request.
+1. **📦 Install**: `pip install -r requirements.txt`
+2. **📂 Prepare Data**: Generate conversation data or use existing JSON files
+3. **📦 Sequence Packing**: `python scripts/sequence_packing.py --input_dir <data> --output_dir <output>`
+4. **📊 Extract Features**: Run feature extraction with your target model
+5. **🏋️ Train Drafter**: Train the EAGLE drafter model with LoRA
+6. **🎯 Evaluate**: Run evaluation to measure speedup and acceptance rate
+7. **⚙️ Customize**: Adjust `speculation_depth`, `lora_rank`, `max_seq_len` as needed
 
-## License
+---
+
+## 🤝 Contributing
+
+Contributions are welcome! 💡 Please open an issue or submit a pull request.
+
+---
+
+## 📄 License
 
 MIT License - See [LICENSE](LICENSE) for details.
 
@@ -177,6 +209,6 @@ MIT License - See [LICENSE](LICENSE) for details.
 
 <div align="center">
 
-**P-EAGLE: Making LLM inference 1.5-3x faster through parallel speculative decoding**
+**🚀 P-EAGLE: Making LLM inference 1.5-3x faster through parallel speculative decoding**
 
 </div>

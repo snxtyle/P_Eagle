@@ -67,6 +67,93 @@ def _patched_torch_sdpa(query, key, value, attn_mask=None, dropout_p=0.0, is_cau
 _F.scaled_dot_product_attention = _patched_torch_sdpa
 
 
+def _get_model_layers(model):
+    """
+    Get transformer layers from model, handling different model architectures and PeftModel.
+
+    Handles:
+    - Regular models: model.layers
+    - Gemma3 architecture: model.model.language_model.layers
+    - PeftModel wrapping: model.model.layers, model.base_model.model.layers
+    - Various nested architectures
+    """
+    # Try direct layers attribute
+    if hasattr(model, 'layers'):
+        return model.layers
+
+    # Try model.model.layers (common for some architectures)
+    if hasattr(model, 'model') and hasattr(model.model, 'layers'):
+        return model.model.layers
+
+    # Try Gemma3 architecture: model.model.language_model.layers
+    if hasattr(model, 'model') and hasattr(model.model, 'language_model') and hasattr(model.model.language_model, 'layers'):
+        return model.model.language_model.layers
+
+    # Try base_model.model.layers (PeftModel with nested base)
+    if hasattr(model, 'base_model') and hasattr(model.base_model, 'model') and hasattr(model.base_model.model, 'layers'):
+        return model.base_model.model.layers
+
+    # Try Gemma3 PeftModel: model.model.model.language_model.layers
+    # IMPORTANT: For PeftModel, model.base_model is LoraModel, not the base model
+    # So we need model.model.model.language_model.layers, NOT model.base_model.model.language_model.layers
+    if hasattr(model, 'model') and hasattr(model.model, 'model') and hasattr(model.model.model, 'language_model') and hasattr(model.model.model.language_model, 'layers'):
+        return model.model.model.language_model.layers
+
+    # Try old path: model.base_model.model.language_model.layers (for non-PeftModel wrapped)
+    if hasattr(model, 'base_model') and hasattr(model.base_model, 'model') and hasattr(model.base_model.model, 'language_model') and hasattr(model.base_model.model.language_model, 'layers'):
+        return model.base_model.model.language_model.layers
+
+    # Try base_model.model.model.layers (PeftModel wrapped model)
+    if hasattr(model, 'base_model') and hasattr(model.base_model, 'model') and hasattr(model.base_model.model, 'model') and hasattr(model.base_model.model.model, 'layers'):
+        return model.base_model.model.model.layers
+
+    # Try base_model.base_model.model.layers (PeftModel wrapping PeftModel)
+    if hasattr(model, 'base_model') and hasattr(model.base_model, 'base_model') and hasattr(model.base_model.base_model, 'model') and hasattr(model.base_model.base_model.model, 'layers'):
+        return model.base_model.base_model.model.layers
+
+    # Try getting from config
+    if hasattr(model, 'config') and hasattr(model.config, 'num_hidden_layers'):
+        raise AttributeError(f"Model has {model.config.num_hidden_layers} layers but no accessible layers attribute. Model type: {type(model)}")
+
+    raise AttributeError(f"Could not find layers attribute. Model type: {type(model)}")
+
+
+def _set_model_layers(model, layers):
+    """
+    Set transformer layers on model, handling different model architectures and PeftModel.
+    """
+    if hasattr(model, 'layers'):
+        model.layers = layers
+        return
+
+    if hasattr(model, 'model') and hasattr(model.model, 'layers'):
+        model.model.layers = layers
+        return
+
+    # Try Gemma3 architecture: model.model.language_model.layers
+    if hasattr(model, 'model') and hasattr(model.model, 'language_model') and hasattr(model.model.language_model, 'layers'):
+        model.model.language_model.layers = layers
+        return
+
+    if hasattr(model, 'base_model') and hasattr(model.base_model, 'model') and hasattr(model.base_model.model, 'layers'):
+        model.base_model.model.layers = layers
+        return
+
+    # Try Gemma3 PeftModel: model.model.model.language_model.layers
+    if hasattr(model, 'model') and hasattr(model.model, 'model') and hasattr(model.model.model, 'language_model') and hasattr(model.model.model.language_model, 'layers'):
+        model.model.model.language_model.layers = layers
+        return
+
+    # Try old path: model.base_model.model.language_model.layers (for non-PeftModel wrapped)
+    if hasattr(model, 'base_model') and hasattr(model.base_model, 'model') and hasattr(model.base_model.model, 'language_model') and hasattr(model.base_model.model.language_model, 'layers'):
+        model.base_model.model.language_model.layers = layers
+        return
+
+    if hasattr(model, 'base_model') and hasattr(model.base_model, 'model') and hasattr(model.base_model.model, 'model') and hasattr(model.base_model.model.model, 'layers'):
+        model.base_model.model.model.layers = layers
+        return
+
+
 class Eagle3FirstLayer(nn.Module):
     """
     Wrapper for the first decoder layer that handles 2x hidden size input.
@@ -126,10 +213,20 @@ class Eagle3FirstLayer(nn.Module):
             "hidden_states": hidden_states,
         }
 
-        # Pass through kwargs that self_attn expects (filter out layer-specific ones)
-        for key in ["attention_mask", "position_embeddings", "position_ids", "past_key_value"]:
-            if key in kwargs:
-                attn_kwargs[key] = kwargs[key]
+        # Pass through kwargs that self_attn expects
+        # Gemma3 uses position_embeddings instead of position_ids
+        # and past_key_values (with 's') instead of past_key_value
+        if "attention_mask" in kwargs:
+            attn_kwargs["attention_mask"] = kwargs["attention_mask"]
+        if "position_embeddings" in kwargs:
+            attn_kwargs["position_embeddings"] = kwargs["position_embeddings"]
+        if "position_ids" in kwargs:
+            # Gemma3 uses position_embeddings, not position_ids - skip if not supported
+            pass
+        if "past_key_value" in kwargs:
+            attn_kwargs["past_key_values"] = kwargs["past_key_value"]
+        if "past_key_values" in kwargs:
+            attn_kwargs["past_key_values"] = kwargs["past_key_values"]
 
         attn_output = self.base_layer.self_attn(**attn_kwargs)
 
@@ -404,15 +501,15 @@ class EagleDrafterModel(nn.Module):
     def _patch_remaining_layers_with_flash_attention(self, dtype: torch.dtype):
         """Patch remaining transformer layers with Flash Attention for full optimization."""
         base_model = self.base_model
-        if hasattr(base_model, 'model'):
-            base_model = base_model.model
 
-        if not hasattr(base_model, 'layers'):
+        try:
+            layers = _get_model_layers(base_model)
+        except AttributeError:
             return
 
         num_patched = 0
-        for idx in range(1, len(base_model.layers)):  # Skip first layer (already handled)
-            layer = base_model.layers[idx]
+        for idx in range(1, len(layers)):  # Skip first layer (already handled)
+            layer = layers[idx]
             if not hasattr(layer, 'self_attn'):
                 continue
 
@@ -475,14 +572,13 @@ class EagleDrafterModel(nn.Module):
         3. Optionally use Flash Attention for optimized computation
         """
         base_model = self.base_model
-        if hasattr(base_model, 'model'):
-            base_model = base_model.model
 
         # Get first decoder layer
-        if hasattr(base_model, 'layers'):
-            first_layer = base_model.layers[0]
-        else:
-            print("Warning: Could not find layers attribute, skipping first layer modification")
+        try:
+            layers = _get_model_layers(base_model)
+            first_layer = layers[0]
+        except AttributeError as e:
+            print(f"Warning: Could not find layers attribute, skipping first layer modification: {e}")
             return
 
         # Detect model type for proper norm class (use text_config for multimodal models)
@@ -571,8 +667,13 @@ class EagleDrafterModel(nn.Module):
         wrapped_layer = Eagle3FirstLayer(first_layer, hidden_size, RMSNormClass, dtype=dtype)
         wrapped_layer = wrapped_layer.to(dtype=dtype, device=self.device)
 
-        # Replace the layer in the model
-        base_model.layers[0] = wrapped_layer
+        # Replace the layer in the model using helper function
+        try:
+            model_layers = _get_model_layers(base_model)
+            model_layers[0] = wrapped_layer
+        except AttributeError:
+            print("Warning: Could not set layers[0], first layer modification may not persist")
+            return
 
         # Store reference to modified first layer for forward pass
         self.modified_first_layer = wrapped_layer
@@ -654,17 +755,17 @@ class EagleDrafterModel(nn.Module):
             causal_mask = None
 
         # Process first layer with EAGLE-3 handling (wrapped with Eagle3FirstLayer)
-        # CRITICAL FIX: Try multiple methods to find the first layer
+        # CRITICAL FIX: Use original self.base_model for layer access (not navigated base_model)
         # Method 1: Use stored reference if available
         if hasattr(self, 'modified_first_layer') and self.modified_first_layer is not None:
             first_layer = self.modified_first_layer
-        # Method 2: Navigate through model structure
-        elif hasattr(base_model, 'layers'):
-            first_layer = base_model.layers[0]
-        elif hasattr(self.base_model, 'model') and hasattr(self.base_model.model, 'layers'):
-            first_layer = self.base_model.model.layers[0]
+        # Method 2: Use helper function for different model architectures (including PeftModel)
         else:
-            raise AttributeError(f"Could not find layers attribute. Model type: {type(self.base_model)}")
+            try:
+                layers = _get_model_layers(self.base_model)  # Use original, not navigated
+                first_layer = layers[0]
+            except AttributeError as e:
+                raise AttributeError(f"Could not find layers attribute. Model type: {type(self.base_model)}") from e
 
         # Compute position embeddings for rotary attention (needed for Gemma3, Qwen2, etc.)
         batch_size, seq_len = hidden_states.shape[0], hidden_states.shape[1]
@@ -672,23 +773,56 @@ class EagleDrafterModel(nn.Module):
         position_ids = position_ids.unsqueeze(0).expand(batch_size, -1)
 
         # Get rotary embeddings from model
-        # CRITICAL FIX: Try multiple paths to find rotary_emb for different model architectures
+        # CRITICAL FIX: Try multiple paths where rotary_emb might be located
+        # Gemma3 uses language_model.rotary_emb
         position_embeddings = None
         rotary_emb = None
 
-        # Try different paths where rotary_emb might be located
-        if hasattr(base_model, 'rotary_emb'):
-            rotary_emb = base_model.rotary_emb
-        elif hasattr(self.base_model, 'model') and hasattr(self.base_model.model, 'rotary_emb'):
-            rotary_emb = self.base_model.model.rotary_emb
-        elif hasattr(self.base_model, 'model') and hasattr(self.base_model.model, 'model') and hasattr(self.base_model.model.model, 'rotary_emb'):
-            rotary_emb = self.base_model.model.model.rotary_emb
+        # Comprehensive search for rotary_emb across different model architectures
+        def _find_rotary_emb(model_obj, depth=0):
+            """Recursively search for rotary_emb in model."""
+            if depth > 4 or model_obj is None:
+                return None
+            # Try direct attribute
+            if hasattr(model_obj, 'rotary_emb') and model_obj.rotary_emb is not None:
+                return model_obj.rotary_emb
+            # Try language_model.rotary_emb (Gemma3 structure)
+            if hasattr(model_obj, 'language_model'):
+                lm = model_obj.language_model
+                if hasattr(lm, 'rotary_emb') and lm.rotary_emb is not None:
+                    return lm.rotary_emb
+            # Try model.language_model.rotary_emb
+            if hasattr(model_obj, 'model'):
+                result = _find_rotary_emb(model_obj.model, depth+1)
+                if result is not None:
+                    return result
+            # Try base_model.language_model.rotary_emb (PeftModel)
+            if hasattr(model_obj, 'base_model'):
+                result = _find_rotary_emb(model_obj.base_model, depth+1)
+                if result is not None:
+                    return result
+            return None
+
+        # Try all references
+        rotary_emb = _find_rotary_emb(self.base_model)
+        if rotary_emb is None:
+            rotary_emb = _find_rotary_emb(base_model)
+
+        # Fallback: try from first layer's attention if available
+        if rotary_emb is None and hasattr(first_layer, 'base_layer') and hasattr(first_layer.base_layer, 'self_attn'):
+            if hasattr(first_layer.base_layer.self_attn, 'rotary_emb'):
+                rotary_emb = first_layer.base_layer.self_attn.rotary_emb
 
         if rotary_emb is not None:
             # The rotary_emb was already patched in _modify_first_layer_for_concat_injection
             # to always use layer_type='global', so no need to set it here
-            cos, sin = rotary_emb(hidden_states, position_ids)
-            position_embeddings = (cos, sin)
+            try:
+                cos, sin = rotary_emb(hidden_states, position_ids)
+                position_embeddings = (cos, sin)
+            except Exception as e:
+                # If computation fails, set position_embeddings to None
+                # The Gemma3 attention will handle missing position embeddings
+                position_embeddings = None
 
         # Call wrapped first layer with position embeddings
         # The Eagle3FirstLayer wrapper handles the 2x input -> hidden output conversion
@@ -700,17 +834,12 @@ class EagleDrafterModel(nn.Module):
 
         # Process remaining layers normally
         # Note: First layer output is now [batch, seq, hidden_size] (projected back from 2x)
-        # CRITICAL FIX: Ensure we have the correct layers reference for Gemma3 models
-        remaining_layers = None
-        if hasattr(base_model, 'layers'):
-            remaining_layers = base_model.layers[1:]
-        elif hasattr(self.base_model, 'model') and hasattr(self.base_model.model, 'layers'):
-            remaining_layers = self.base_model.model.layers[1:]
-        elif hasattr(self.base_model, 'model') and hasattr(self.base_model.model, 'model') and hasattr(self.base_model.model.model, 'layers'):
-            remaining_layers = self.base_model.model.model.layers[1:]
-
-        if remaining_layers is None:
-            raise AttributeError(f"Could not find layers to iterate. Model type: {type(self.base_model)}")
+        # CRITICAL FIX: Use helper function with original self.base_model (including PeftModel)
+        try:
+            all_layers = _get_model_layers(self.base_model)  # Use original, not navigated
+            remaining_layers = all_layers[1:]
+        except AttributeError as e:
+            raise AttributeError(f"Could not find layers to iterate. Model type: {type(self.base_model)}") from e
 
         for layer in remaining_layers:
             # Qwen2 layers expect position_embeddings for rotary attention
@@ -738,12 +867,39 @@ class EagleDrafterModel(nn.Module):
 
         mtp_predictions = []
         for k, mtp_head in enumerate(self.mtp_heads):
+            # CRITICAL FIX: Training and inference must use the SAME input
+            #
+            # During inference, ALL heads use the SAME hidden state at position T
+            # to predict tokens at T+1, T+2, T+3, T+4 (K draft tokens).
+            #
+            # The OLD code had a mismatch:
+            # - Training: head k used hidden states [0, N-2-k] (different for each head)
+            # - Inference: all heads used hidden state [N-1] (same for all)
+            #
+            # This caused head k to never see hidden state at N-1 during training,
+            # but inference ALWAYS uses hidden[N-1]. This is the root cause of
+            # heads 2-4 having 0% acceptance!
+            #
+            # The FIX: Use the SAME input for all heads during training
+            # - ALL heads use hidden states [0, N-2] (or [0, N-1])
+            # - Loss computation shifts targets appropriately for each head
+            #
+            # For inference: hidden[T] predicts tokens at T+1, T+2, T+3, T+4
+            # For training: hidden[0:N-1] predicts:
+            #   - Head 0: token at [1, N-1]
+            #   - Head 1: token at [2, N-1] (shifted by 1)
+            #   - Head 2: token at [3, N-1] (shifted by 2)
+            #   - Head 3: token at [4, N-1] (shifted by 3)
+            #
+            # The loss computation handles the target shifting correctly.
+            # This ensures training matches inference behavior.
+
             if is_training:
-                # TRAINING: Trim projected_hidden to match shifted targets: h_t predicts h_{t+k+1}
-                trim = k + 1
-                pred_input = projected_hidden[:, :-trim] if trim > 0 else projected_hidden
+                # TRAINING: Use FULL sequence for ALL heads
+                # This matches inference where all heads use hidden[N-1]
+                pred_input = projected_hidden
             else:
-                # INFERENCE: Use the last hidden state to predict future tokens
+                # INFERENCE: Use LAST hidden state for ALL heads
                 pred_input = projected_hidden[:, -1:]
 
             pred = mtp_head(pred_input)
@@ -756,6 +912,9 @@ class EagleDrafterModel(nn.Module):
             "lm_logits": None  # Not computing logits in this path
         }
 
+    # DEPRECATED: This method is no longer used. The Eagle3FirstLayer class
+    # (defined above) handles the first layer logic via its forward() method.
+    # Keeping this for reference until confirmed unused, then remove.
     def _eagle3_first_layer_forward(self, layer, hidden_states, attention_mask):
         """
         Custom forward for EAGLE-3 modified first layer.
@@ -938,6 +1097,24 @@ class EagleDrafterModel(nn.Module):
             Path(checkpoint_dir) / "eagle_heads.pt",
             map_location=device
         )
+
+        # CRITICAL FIX: Validate checkpoint keys before loading
+        required_keys = ["dim_projection", "mtp_heads"]
+        missing_keys = [k for k in required_keys if k not in checkpoint]
+        if missing_keys:
+            raise ValueError(
+                f"Checkpoint is missing required keys: {missing_keys}. "
+                f"Available keys: {list(checkpoint.keys())}. "
+                f"The checkpoint may be from a different model architecture."
+            )
+
+        # Validate mtp_heads count matches model
+        if len(checkpoint["mtp_heads"]) != len(model.mtp_heads):
+            raise ValueError(
+                f"Checkpoint has {len(checkpoint['mtp_heads'])} MTP heads, "
+                f"but model expects {len(model.mtp_heads)}. "
+                f"Check that --speculation_depth matches the checkpoint."
+            )
 
         model.dim_projection.load_state_dict(checkpoint["dim_projection"])
         for i, head_state in enumerate(checkpoint["mtp_heads"]):

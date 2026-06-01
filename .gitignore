@@ -21,14 +21,13 @@ env/
 .env/
 
 # Data directories (large, generated)
-data/
-checkpoints/
-checkpoints_peagle
-models_cache/
-outputs/
+data/*
+checkpoints/*
+models_cache/*
+outputs/*
 
-# Logs
-logs/
+# Logs*
+logs/*
 *.log
 
 # Plots and outputs

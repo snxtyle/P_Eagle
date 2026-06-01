@@ -69,6 +69,15 @@ class EagleDataset(Dataset):
                         "mask": 1 if i in train_indices else 0
                     })
 
+        # Handle loss_mask format (our semantic_chunker output)
+        if not segments and "loss_mask" in sample:
+            loss_mask = sample.get("loss_mask", [])
+            for i, mask in enumerate(loss_mask):
+                segments.append({
+                    "index": i,
+                    "mask": mask
+                })
+
         if not segments and messages:
             # Auto-generate segments from message roles
             # Train on assistant responses (mask=1), ignore system/user (mask=0)
@@ -558,13 +567,12 @@ def align_segments_to_tokens(
         start_pos = min(seq_len // 4, seq_len - 1)
         token_mask[start_pos:] = 1
 
-    # CRITICAL FIX: If mask is still all zeros (segment alignment failed),
-    # fall back to marking all tokens as trainable. Better to train on everything
-    # than nothing - the model will still learn useful patterns.
+    # STRICT MODE: If mask is still all zeros, the sample is skipped
+    # This ensures we only train on properly aligned assistant content
+    # Re-extraction with corrected masking is preferred over fallback
     if token_mask.sum() == 0:
-        print(f"  WARNING: All-zero mask after segment alignment. Falling back to training on all tokens.")
-        # Mark all tokens as trainable (will be filtered by attention_mask in training)
-        token_mask[:] = 1
+        print(f"  WARNING: All-zero mask after segment alignment. Sample will be SKIPPED during training.")
+        print(f"  -> Re-extract features with corrected masking to include this sample properly.")
 
     return token_mask
 

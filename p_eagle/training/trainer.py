@@ -793,6 +793,8 @@ class EagleTrainer:
         self.yes = yes
         self.gradient_accumulation_steps = gradient_accumulation_steps
         self.global_step = 0
+        self.current_epoch = 0  # Track epoch for resume capability
+        self._training_state = {}  # Loaded training state for resume
         self.drafter_model_name = drafter_model_name
         self.logger = logger or logging.getLogger("peagle_training")
         self.run_log_dir = run_log_dir
@@ -872,16 +874,28 @@ class EagleTrainer:
             # Unwrap DDP if needed to load checkpoint
             model_to_load = self.model.module if hasattr(self.model, 'module') else self.model
             model_to_load.load_checkpoint(self.resume_from, device=device)
-            # Extract step number from checkpoint name (e.g. checkpoint_step_1000)
-            import re
-            step_match = re.search(r'step_(\d+)', self.resume_from)
-            if step_match:
-                self.global_step = int(step_match.group(1))
+
+            # Load training state from checkpoint
+            import json
+            training_state_path = Path(self.resume_from) / "training_state.json"
+            if training_state_path.exists():
+                with open(training_state_path) as f:
+                    self._training_state = json.load(f)
+                self.current_epoch = self._training_state.get('epoch', 0)
+                self.global_step = self._training_state.get('step', 0)
                 if self.is_main_process:
-                    self.logger.info(f"Resumed from step {self.global_step}")
+                    self.logger.info(f"Loaded training state: epoch={self.current_epoch}, step={self.global_step}")
             else:
+                # Fallback: extract step from folder name
+                import re
+                step_match = re.search(r'step_(\d+)', self.resume_from)
+                if step_match:
+                    self.global_step = int(step_match.group(1))
+                    if self.is_main_process:
+                        self.logger.info(f"Resumed from step {self.global_step}")
                 if self.is_main_process:
-                    self.logger.warning("Could not extract step number from checkpoint name")
+                    self.logger.warning("No training_state.json found, using defaults")
+                self._training_state = {}
 
         # === SPEED OPTIMIZATIONS ===
         # Enable TF32 for faster matmul (10% speedup, no quality loss)
@@ -1423,27 +1437,32 @@ class EagleTrainer:
                 if i >= active_heads:
                     break
 
-                # Get shifted targets for this head
+                # CRITICAL FIX: Align validation with training logic
+                # With new model, pred_hidden is full sequence [B, N, H] for all heads
+                # Head k: prediction at position t matches target at position t + shift
                 shift = i + 1
-                if shift >= target_hidden.shape[1]:
-                    continue
 
-                pred_shifted = pred_hidden[:, :-shift, :]
-                target_shifted = target_hidden[:, shift:, :]
+                # Trim predictions and targets to match training logic
+                pred_trimmed = pred_hidden[:, :-shift, :]  # Remove last shift positions
+                target_trimmed = target_hidden[:, shift:, :]  # Start from shift position
 
                 # Ensure shapes match (trim to minimum length)
-                min_len = min(pred_shifted.shape[1], target_shifted.shape[1])
+                min_len = min(pred_trimmed.shape[1], target_trimmed.shape[1])
                 if min_len <= 0:
                     continue
 
-                pred_trimmed = pred_shifted[:, :min_len, :]
-                target_trimmed = target_shifted[:, :min_len, :]
-                mask_trimmed = loss_mask[:, shift:shift + min_len]
+                pred_trimmed = pred_trimmed[:, :min_len, :]
+                target_trimmed = target_trimmed[:, :min_len, :]
+
+                # CRITICAL FIX: Use SAME mask alignment as training
+                # Training uses: loss_mask[:, :min_len]
+                # Validation was using: loss_mask[:, shift:shift + min_len] (WRONG!)
+                mask_trimmed = loss_mask[:, :min_len]
 
                 # FIX: Use precomputed target_token_ids, properly shifted for MTP
                 # target_token_ids[t] = model's argmax predicting token at position t+1
                 # MTP head i predicts position t+i+1 → targets at index t+i = target_token_ids[i:]
-                target_ids_shifted = target_token_ids[:, i:i + min_len]
+                target_ids_shifted = target_token_ids[:, shift:shift + min_len]
 
                 # Use SAME loss function as training for consistency
                 ce_loss_k, mse_loss_k, _ = hidden_state_token_loss(
@@ -1499,11 +1518,33 @@ class EagleTrainer:
                 raise RuntimeError("GPU memory too low to begin training")
         self.gpu_monitor.log_memory_summary()
 
-        # Sanity check: verify first batch has non-zero loss mask
+        # Sanity check: verify first batch has non-zero loss mask and check per-head coverage
         self.logger.info("\nVerifying training data...")
         first_batch = next(iter(self.train_loader))
         mask_sum = first_batch["loss_mask"].sum().item()
-        self.logger.info(f"  First batch mask sum: {mask_sum}")
+        seq_len = first_batch["loss_mask"].shape[1]
+        self.logger.info(f"  First batch mask sum: {mask_sum} out of {seq_len} tokens")
+
+        # Check mask distribution
+        mask = first_batch["loss_mask"][0].numpy()
+        mask_ones_positions = np.where(mask == 1)[0]
+        if len(mask_ones_positions) > 0:
+            first_one = mask_ones_positions[0]
+            last_one = mask_ones_positions[-1]
+            self.logger.info(f"  Mask coverage: positions {first_one} to {last_one} ({last_one - first_one + 1} positions)")
+
+            # Calculate per-head overlap (how many positions have mask=1 for each head)
+            for k in range(min(4, self.speculation_depth)):
+                shift = k + 1
+                # For head k: predictions at [0, N-2-k], targets at [k+1, N-1]
+                # Mask needed at: predictions [0, N-2-k] AND targets [k+1, N-1+k+1]
+                # Overlap of mask requirements: [k+1, N-2-k]
+                overlap_start = k + 1
+                overlap_end = seq_len - 2 - k
+                if overlap_start < overlap_end:
+                    mask_in_overlap = mask[overlap_start:overlap_end].sum()
+                    self.logger.info(f"  Head {k+1}: overlap region [{overlap_start}, {overlap_end}], mask sum = {mask_in_overlap}")
+
         if mask_sum == 0:
             self.logger.warning("  WARNING: Loss mask is all zeros! Training will fail.")
             self.logger.warning("  Check that dataset has proper 'loss_mask_segments'.")
@@ -1511,6 +1552,13 @@ class EagleTrainer:
             self.logger.info(f"  OK: {mask_sum} trainable tokens in first batch")
 
         for epoch in range(self.num_epochs):
+            self.current_epoch = epoch  # Track for resume capability
+
+            # Skip epochs if resuming from checkpoint
+            if self.resume_from and epoch < self._training_state.get('epoch', 0):
+                self.logger.info(f"Skipping epoch {epoch + 1} (already completed)")
+                continue
+
             # Set epoch for distributed sampler to ensure different shuffling each epoch
             if self.train_sampler is not None:
                 self.train_sampler.set_epoch(epoch)
@@ -1564,8 +1612,28 @@ class EagleTrainer:
             batch_idx = 0
             accumulation_counter = 0
 
+            # FIX: Skip batches when resuming to continue from correct position
+            if self.global_step > 0 and self.is_main_process:
+                batches_per_epoch = len(self.train_loader)
+                # Calculate which batch we should start from in this epoch
+                # global_step = number of optimizer steps completed
+                # Each step processes grad_accum_steps batches
+                # So batches_skipped = global_step * grad_accum_steps
+                # But we only skip within current epoch
+                batches_skipped = (self.global_step * self.gradient_accumulation_steps) % batches_per_epoch
+                if batches_skipped > 0 and batches_skipped < batches_per_epoch:
+                    self.logger.info(f"Resuming: skipping first {batches_skipped} batches to continue from step {self.global_step}...")
+                    for _ in range(batches_skipped):
+                        try:
+                            _ = next(batch_iterator)
+                        except StopIteration:
+                            break
+                    batch_idx = batches_skipped
+                    self.logger.info(f"Resumed from batch {batch_idx}/{batches_per_epoch}")
+
             if self.is_main_process:
-                self.logger.info(f"Starting training loop with {len(self.train_loader)} total steps...")
+                remaining = len(self.train_loader) - batch_idx
+                self.logger.info(f"Starting training loop with {remaining} remaining steps...")
 
             while batch_idx < len(self.train_loader):
                 # Check GPU memory periodically
@@ -1856,19 +1924,25 @@ class EagleTrainer:
         This prevents the compounding error problem in speculative decoding.
 
         Schedule:
-        - Epochs 1-2: Train only head 1 (foundation)
-        - Epochs 3-4: Train heads 1-2
-        - Epochs 5-6: Train heads 1-3
-        - Epochs 7+: Train all heads
+        - Epoch 1: Train only head 1 (foundation)
+        - Epoch 2: Train heads 1-2
+        - Epoch 3: Train heads 1-3
+        - Epoch 4+: Train all heads
+
+        CRITICAL FIX: This ensures each head learns to predict its specific offset
+        before adding the complexity of deeper heads. This is essential because
+        deeper heads need good shallow heads to provide context.
         """
-        if epoch <= 2:
-            return 1
-        elif epoch <= 4:
-            return 2
-        elif epoch <= 6:
-            return 3
+        epoch_in_training = epoch - 1  # Convert to 0-indexed
+
+        if epoch_in_training < 1:
+            return 1  # Epoch 1: only head 1
+        elif epoch_in_training < 2:
+            return 2  # Epoch 2: heads 1-2
+        elif epoch_in_training < 3:
+            return 3  # Epoch 3: heads 1-3
         else:
-            return self.speculation_depth
+            return self.speculation_depth  # Epoch 4+: all heads
 
     @oom_recovery_handler
     def _training_step(self, batch: Dict[str, torch.Tensor], epoch: int = 1,
@@ -1956,48 +2030,81 @@ class EagleTrainer:
 
             shift = k + 1
 
-            if pred_hidden.shape[1] > 0:
-                target_shifted = target_hidden[:, shift:shift + pred_hidden.shape[1]]
-                mask_shifted = loss_mask[:, shift:shift + pred_hidden.shape[1]]
+            # CRITICAL FIX: Handle the new model output where all heads produce full sequence [B, N, H]
+            #
+            # For head k:
+            # - Prediction at position t should match target at position t + shift
+            # - So pred[t] predicts target[t + shift]
+            # - This means: pred[:, :-shift] aligns with target[:, shift:]
+            #
+            # For example:
+            # - Head 0 (shift=1): pred[:-1] vs target[1:] - predicting next token
+            # - Head 1 (shift=2): pred[:-2] vs target[2:] - predicting token at +2
+            # - Head 2 (shift=3): pred[:-3] vs target[3:] - predicting token at +3
+            # - Head 3 (shift=4): pred[:-4] vs target[4:] - predicting token at +4
+            #
+            # This ensures training matches inference where all heads use hidden[N-1]
+            # to predict tokens at N, N+1, N+2, N+3.
 
-                # DIAGNOSTIC: Track mask coverage for this head
-                mask_coverage = mask_shifted.sum().item() / (mask_shifted.numel() + 1e-8)
-                head_mask_coverages.append(mask_coverage)
+            seq_len = target_hidden.shape[1]
 
-                min_len = min(pred_hidden.shape[1], target_shifted.shape[1])
+            # Trim predictions and targets for this head
+            pred_trimmed = pred_hidden[:, :-shift]  # Remove last shift positions
+            target_trimmed = target_hidden[:, shift:]  # Start from shift position
 
-                if min_len > 0:
-                    pred_trimmed = pred_hidden[:, :min_len]
-                    target_trimmed = target_shifted[:, :min_len]
-                    mask_trimmed = mask_shifted[:, :min_len]
+            # Ensure matching lengths
+            min_len = min(pred_trimmed.shape[1], target_trimmed.shape[1])
 
-                # FIX: Use precomputed target_token_ids, properly shifted for MTP
-                # target_token_ids[t] = model's argmax predicting token at position t+1
-                # MTP head k predicts position t+k+1 → targets at index t+k = target_token_ids[k:]
-                target_ids_shifted = target_token_ids[:, k:k + min_len]
+            if min_len <= 0:
+                if self.global_step % 100 == 0 and self.is_main_process:
+                    self.logger.warning(f"Head {k+1}: min_len={min_len}, pred_shape={pred_trimmed.shape}, target_shape={target_trimmed.shape}, skipping")
+                continue
 
-                # Skip if mask is all zeros (no learning signal)
-                if mask_trimmed.sum() == 0:
-                    continue
+            pred_trimmed = pred_trimmed[:, :min_len]
+            target_trimmed = target_trimmed[:, :min_len]
 
-                # P-EAGLE aligned loss: match token distributions via target lm_head
-                ce_loss_k, mse_loss_k, acc_k = hidden_state_token_loss(
-                    pred_trimmed,
-                    target_trimmed,
-                    self.target_lm_head,
-                    mask_trimmed,
-                    temperature=1.0,
-                    ce_weight=0.7,
-                    mse_weight=0.3,
-                    target_token_ids=target_ids_shifted,
-                    label_smoothing=self.label_smoothing
+            # Mask should cover positions where both prediction and target are valid
+            # After trimming: pred positions [0, min_len-1] predict targets [shift, shift+min_len-1]
+            # Mask needs to cover positions [0, min_len-1] in both
+            mask_trimmed = loss_mask[:, :min_len]
+
+            # DIAGNOSTIC: Log mask coverage for debugging
+            if self.global_step % 100 == 0 and self.is_main_process:
+                mask_sum = mask_trimmed.sum().item()
+                self.logger.info(
+                    f"Head {k+1}: pred_shape={pred_trimmed.shape}, target_shape={target_trimmed.shape}, "
+                    f"mask_sum={mask_sum} ({mask_sum/min_len*100:.1f}% coverage)"
                 )
 
-                ce_losses.append(ce_loss_k)
-                mse_losses.append(mse_loss_k)
-                token_accs.append(acc_k.item())
-                # Store raw MSE for reporting (not scaled)
-                mtp_losses.append(mse_loss_k.item())
+            # Skip if mask is all zeros (no learning signal)
+            if mask_trimmed.sum() == 0:
+                if self.global_step % 100 == 0 and self.is_main_process:
+                    self.logger.warning(f"Head {k+1} SKIPPED: mask is all zeros")
+                continue
+
+            # Get target token IDs for this head (precomputed from target model)
+            if target_token_ids is not None:
+                target_ids_shifted = target_token_ids[:, shift:shift + min_len]
+            else:
+                target_ids_shifted = None
+
+            # P-EAGLE aligned loss: match token distributions via target lm_head
+            ce_loss_k, mse_loss_k, acc_k = hidden_state_token_loss(
+                pred_trimmed,
+                target_trimmed,
+                self.target_lm_head,
+                mask_trimmed,
+                temperature=1.0,
+                ce_weight=0.6,
+                mse_weight=0.4,
+                target_token_ids=target_ids_shifted,
+                label_smoothing=self.label_smoothing
+            )
+
+            ce_losses.append(ce_loss_k)
+            mse_losses.append(mse_loss_k)
+            token_accs.append(acc_k.item())
+            mtp_losses.append(mse_loss_k.item())
 
         # Combine losses: Cross-Entropy (token matching) + MSE (hidden state)
         # CE ensures tokens match, MSE ensures hidden states are structurally similar
@@ -2128,7 +2235,20 @@ class EagleTrainer:
         model_to_save = self.model.module if hasattr(self.model, 'module') else self.model
         # Pass target_lm_head to ensure vocab compatibility during inference
         model_to_save.save_checkpoint(str(checkpoint_dir), target_lm_head=self.target_lm_head)
-        self.logger.info(f"Checkpoint saved to {checkpoint_dir}")
+
+        # Save training state for resume capability
+        import json
+        training_state = {
+            "epoch": self.current_epoch,
+            "step": self.global_step,
+            "num_epochs": self.num_epochs,
+            "batch_size": self.batch_size,
+            "gradient_accumulation_steps": self.gradient_accumulation_steps,
+        }
+        with open(checkpoint_dir / "training_state.json", "w") as f:
+            json.dump(training_state, f, indent=2)
+
+        self.logger.info(f"Checkpoint saved to {checkpoint_dir} (epoch={self.current_epoch}, step={self.global_step})")
 
 
 def main():

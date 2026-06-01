@@ -298,10 +298,12 @@ def evaluate_baseline(target_model_name: str, prompts: List[str], max_tokens: in
     all_perplexities = []
     all_generated_tokens = []  # For text equivalence comparison
 
-    for i, prompt in enumerate(prompts):
+    for i, prompt_item in enumerate(prompts):
         print(f"  [{i+1}/{len(prompts)}] Generating...", end=" ", flush=True)
 
-        input_ids = tokenizer.encode(prompt, return_tensors="pt").to(model.device)
+        # Handle both dict and string prompt formats
+        prompt_text = prompt_item["prompt"] if isinstance(prompt_item, dict) else prompt_item
+        input_ids = tokenizer.encode(prompt_text, return_tensors="pt").to(model.device)
         original_length = input_ids.shape[1]
 
         start = time.time()
@@ -328,7 +330,7 @@ def evaluate_baseline(target_model_name: str, prompts: List[str], max_tokens: in
         tps = calculate_tps(tokens_generated, elapsed)
 
         results.append({
-            "prompt": prompt[:80] + "..." if len(prompt) > 80 else prompt,
+            "prompt": prompt_text[:80] + "..." if len(prompt_text) > 80 else prompt_text,
             "tokens": tokens_generated,
             "time": elapsed,
             "tps": tps,
@@ -438,26 +440,46 @@ def evaluate_speculative(drafter_checkpoint: str, target_model_name: str,
     else:
         raise ValueError("Could not find lm_head in target model")
 
-    drafter_output_dim = 640  # gemma-3-270m-it's embedding/output dimension
-    target_hidden_dim = 2560  # What the target model expects (from training)
+    # Get actual dimensions from the loaded models
+    drafter_hidden_dim = drafter.hidden_dim  # Actual drafter hidden dimension
+    # Gemma3 has hidden_size in text_config, not at top level
+    if hasattr(target_model.config, 'hidden_size'):
+        target_hidden_dim = target_model.config.hidden_size
+    elif hasattr(target_model.config, 'text_config'):
+        target_hidden_dim = target_model.config.text_config.hidden_size
+    else:
+        # Fallback to drafter's target_hidden_dim
+        target_hidden_dim = drafter.target_hidden_dim
 
-    print(f"Drafter output dim: {drafter_output_dim}")
+    print(f"Drafter hidden dim: {drafter_hidden_dim}")
     print(f"Target hidden dim: {target_hidden_dim}")
 
-    # Load projection weights from drafter if available
-    if hasattr(drafter, 'target_hidden_proj'):
-        with torch.no_grad():
-            src_weight = drafter.target_hidden_proj.weight
-            src_bias = drafter.target_hidden_proj.bias
-            lm_head_projection = torch.nn.Linear(target_hidden_dim, drafter_output_dim, dtype=torch.bfloat16).to("cuda")
+    # Create projection layer if dimensions differ, otherwise use identity
+    if drafter_hidden_dim != target_hidden_dim:
+        # Need to project drafter hidden to target hidden
+        print(f"Creating projection: {drafter_hidden_dim} -> {target_hidden_dim}")
+        lm_head_projection = torch.nn.Linear(drafter_hidden_dim, target_hidden_dim, dtype=torch.bfloat16).to("cuda")
+        # Load projection weights from drafter if available
+        if hasattr(drafter, 'target_hidden_proj'):
             with torch.no_grad():
-                lm_head_projection.weight.copy_(src_weight)
+                src_weight = drafter.target_hidden_proj.weight
+                src_bias = drafter.target_hidden_proj.bias
+                # The drafter's projection maps target_hidden -> drafter_hidden
+                # We need the reverse: drafter_hidden -> target_hidden
+                # If shapes match after transpose, use them; otherwise init fresh
+                if src_weight.shape == (target_hidden_dim, drafter_hidden_dim):
+                    lm_head_projection.weight.copy_(src_weight)
+                elif src_weight.t().shape == lm_head_projection.weight.shape:
+                    lm_head_projection.weight.copy_(src_weight.t())
+                else:
+                    print(f"  Warning: projection shape mismatch ({src_weight.shape} vs {lm_head_projection.weight.shape}), using fresh init")
                 if src_bias is not None:
                     lm_head_projection.bias.copy_(src_bias)
-        print(f"Loaded projection weights: {target_hidden_dim} -> {drafter_output_dim}")
+        print(f"Loaded projection weights: {drafter_hidden_dim} -> {target_hidden_dim}")
     else:
-        print(f"Warning: No projection weights found, using random init")
-        lm_head_projection = torch.nn.Linear(target_hidden_dim, drafter_output_dim, dtype=torch.bfloat16).to("cuda")
+        # Same dimensions - use identity mapping
+        print("Same hidden dimensions - using identity projection")
+        lm_head_projection = torch.nn.Identity().to("cuda")
 
     speculation_depth = drafter.speculation_depth
     print(f"Speculation depth (K): {speculation_depth}")
@@ -472,10 +494,12 @@ def evaluate_speculative(drafter_checkpoint: str, target_model_name: str,
     all_perplexities = []
     all_generated_tokens = []  # For text equivalence
 
-    for i, prompt in enumerate(prompts):
+    for i, prompt_item in enumerate(prompts):
         print(f"  [{i+1}/{len(prompts)}] Speculating...", end=" ", flush=True)
 
-        input_ids = tokenizer.encode(prompt, return_tensors="pt").to("cuda")
+        # Handle both dict and string prompt formats
+        prompt_text = prompt_item["prompt"] if isinstance(prompt_item, dict) else prompt_item
+        input_ids = tokenizer.encode(prompt_text, return_tensors="pt").to("cuda")
         original_length = input_ids.shape[1]
         generated = input_ids.clone()
 
@@ -582,7 +606,7 @@ def evaluate_speculative(drafter_checkpoint: str, target_model_name: str,
         sample_efficiency = calculate_target_pass_efficiency(tokens_generated, num_verification_passes)
 
         results.append({
-            "prompt": prompt[:80] + "..." if len(prompt) > 80 else prompt,
+            "prompt": prompt_text[:80] + "..." if len(prompt_text) > 80 else prompt_text,
             "tokens": tokens_generated,
             "mal": mal,
             "time": elapsed,
@@ -655,7 +679,7 @@ Examples:
       --max_tokens 100
         """
     )
-    parser.add_argument("--drafter_checkpoint", default="./checkpoints/best_model",
+    parser.add_argument("--drafter_checkpoint", default=None,
                        help="Path to trained drafter checkpoint")
     parser.add_argument("--target_model", default="google/gemma-3-4b-it",
                        help="Target model (MUST match the one used for feature extraction)")
@@ -714,61 +738,62 @@ Examples:
         baseline_tps = baseline_results["mean_tps"]
         baseline_ppl = baseline_results["mean_perplexity"]
 
-    # Evaluate with drafter
-    print("\n" + "="*70)
-    print("STEP 2: Speculative Decoding Evaluation")
-    print("="*70)
-    drafter_results = evaluate_speculative(args.drafter_checkpoint, args.target_model,
-                                          prompts, args.max_tokens, args.temperature, args.top_p,
-                                          quantization=args.quantization)
-    results["drafter"] = drafter_results
-    drafter_tokens = drafter_results.get("_raw_tokens", [])
-    drafter_tps = drafter_results["mean_tps"]
-    drafter_ppl = drafter_results["mean_perplexity"]
-
-    # Calculate speedup
-    speedup = 1.0
-    if args.baseline and baseline_tps > 0:
-        speedup = calculate_speedup(drafter_tps, baseline_tps)
-        ppl_ratio = drafter_ppl / baseline_ppl if baseline_ppl > 0 else 1.0
-
-        # Calculate text equivalence
+    # Evaluate with drafter (only if checkpoint provided)
+    if args.drafter_checkpoint is not None:
         print("\n" + "="*70)
-        print("STEP 3: Text Equivalence Analysis")
+        print("STEP 2: Speculative Decoding Evaluation")
         print("="*70)
+        drafter_results = evaluate_speculative(args.drafter_checkpoint, args.target_model,
+                                              prompts, args.max_tokens, args.temperature, args.top_p,
+                                              quantization=args.quantization)
+        results["drafter"] = drafter_results
+        drafter_tokens = drafter_results.get("_raw_tokens", [])
+        drafter_tps = drafter_results["mean_tps"]
+        drafter_ppl = drafter_results["mean_perplexity"]
 
-        text_equivalence_results = []
-        exact_matches = 0
-        jaccard_similarities = []
-        common_prefixes = []
+        # Calculate speedup
+        speedup = 1.0
+        if args.baseline and baseline_tps > 0:
+            speedup = calculate_speedup(drafter_tps, baseline_tps)
+            ppl_ratio = drafter_ppl / baseline_ppl if baseline_ppl > 0 else 1.0
 
-        for i, (base_toks, draft_toks) in enumerate(zip(baseline_tokens, drafter_tokens)):
-            equiv = calculate_text_equivalence(base_toks, draft_toks, tokenizer)
-            text_equivalence_results.append(equiv)
-            if equiv['exact_match']:
-                exact_matches += 1
-            jaccard_similarities.append(equiv['jaccard_similarity'])
-            common_prefixes.append(equiv['common_prefix_tokens'])
+            # Calculate text equivalence
+            print("\n" + "="*70)
+            print("STEP 3: Text Equivalence Analysis")
+            print("="*70)
 
-        results["text_equivalence"] = {
-            "exact_match_rate": (exact_matches / len(prompts) * 100) if prompts else 0,
-            "mean_jaccard_similarity": np.mean(jaccard_similarities) if jaccard_similarities else 0,
-            "mean_common_prefix": np.mean(common_prefixes) if common_prefixes else 0,
-            "samples": text_equivalence_results
-        }
+            text_equivalence_results = []
+            exact_matches = 0
+            jaccard_similarities = []
+            common_prefixes = []
 
-        print(f"  Exact Match Rate: {exact_matches / len(prompts) * 100:.1f}%")
-        print(f"  Mean Jaccard Similarity: {np.mean(jaccard_similarities):.1f}%")
-        print(f"  Mean Common Prefix: {np.mean(common_prefixes):.1f} tokens")
+            for i, (base_toks, draft_toks) in enumerate(zip(baseline_tokens, drafter_tokens)):
+                equiv = calculate_text_equivalence(base_toks, draft_toks, tokenizer)
+                text_equivalence_results.append(equiv)
+                if equiv['exact_match']:
+                    exact_matches += 1
+                jaccard_similarities.append(equiv['jaccard_similarity'])
+                common_prefixes.append(equiv['common_prefix_tokens'])
 
-        # =================================================================
-        # PRODUCTION REPORT
-        # =================================================================
-        print("\n" + "="*70)
-        print("  PRODUCTION EVALUATION REPORT")
-        print("="*70)
+            results["text_equivalence"] = {
+                "exact_match_rate": (exact_matches / len(prompts) * 100) if prompts else 0,
+                "mean_jaccard_similarity": np.mean(jaccard_similarities) if jaccard_similarities else 0,
+                "mean_common_prefix": np.mean(common_prefixes) if common_prefixes else 0,
+                "samples": text_equivalence_results
+            }
 
-        print(f"""
+            print(f"  Exact Match Rate: {exact_matches / len(prompts) * 100:.1f}%")
+            print(f"  Mean Jaccard Similarity: {np.mean(jaccard_similarities):.1f}%")
+            print(f"  Mean Common Prefix: {np.mean(common_prefixes):.1f} tokens")
+
+            # =================================================================
+            # PRODUCTION REPORT
+            # =================================================================
+            print("\n" + "="*70)
+            print("  PRODUCTION EVALUATION REPORT")
+            print("="*70)
+
+            print(f"""
 ┌──────────────────────────────────────────────────────────────────────┐
 │                     PRIMARY PERFORMANCE METRICS                       │
 ├──────────────────────────────────────────────────────────────────────┤
@@ -792,15 +817,15 @@ Examples:
 │                     PER-HEAD ACCEPTANCE RATES                        │
 ├──────────────────────────────────────────────────────────────────────┤""")
 
-        # Print per-head acceptance with targets
-        head_targets = {1: (75, 85), 2: (55, 65), 3: (40, 48), 4: (25, 35)}
-        for head, rate in sorted(drafter_results['acceptance_by_head'].items()):
-            if head in head_targets:
-                target_low, target_high = head_targets[head]
-                status = '✅' if target_low <= rate <= target_high else '⚠️'
-                print(f"│  Head {head}: {rate:5.1f}% (target: {target_low}-{target_high}%)    {status}  │")
+            # Print per-head acceptance with targets
+            head_targets = {1: (75, 85), 2: (55, 65), 3: (40, 48), 4: (25, 35)}
+            for head, rate in sorted(drafter_results['acceptance_by_head'].items()):
+                if head in head_targets:
+                    target_low, target_high = head_targets[head]
+                    status = '✅' if target_low <= rate <= target_high else '⚠️'
+                    print(f"│  Head {head}: {rate:5.1f}% (target: {target_low}-{target_high}%)    {status}  │")
 
-        print(f"""└──────────────────────────────────────────────────────────────────────┘
+            print(f"""└──────────────────────────────────────────────────────────────────────┘
 
 ┌──────────────────────────────────────────────────────────────────────┐
 │                     QUALITY METRICS                                  │
@@ -819,44 +844,43 @@ Examples:
 └──────────────────────────────────────────────────────────────────────┘
 """)
 
-        # Final verdict
-        print("="*70)
-        print("  VERDICT")
-        print("="*70)
+            # Final verdict
+            print("="*70)
+            print("  VERDICT")
+            print("="*70)
 
-        all_good = (
-            speedup >= 1.5 and
-            drafter_results['mean_mal'] >= 1.5 and
-            drafter_results['overall_acceptance_rate'] >= 50
-        )
+            all_good = (
+                speedup >= 1.5 and
+                drafter_results['mean_mal'] >= 1.5 and
+                drafter_results['overall_acceptance_rate'] >= 50
+            )
 
-        if all_good:
-            print("  ✅ P-EAGLE is working effectively!")
-            print(f"     - Speedup: {speedup:.2f}x")
-            print(f"     - MAL: {drafter_results['mean_mal']:.2f}")
-            print(f"     - Acceptance: {drafter_results['overall_acceptance_rate']:.1f}%")
+            if all_good:
+                print("  ✅ P-EAGLE is working effectively!")
+                print(f"     - Speedup: {speedup:.2f}x")
+                print(f"     - MAL: {drafter_results['mean_mal']:.2f}")
+                print(f"     - Acceptance: {drafter_results['overall_acceptance_rate']:.1f}%")
+            else:
+                print("  ⚠️  P-EAGLE needs optimization")
+                print(f"     - Speedup: {speedup:.2f}x (need >= 1.5x)")
+                print(f"     - MAL: {drafter_results['mean_mal']:.2f} (need >= 1.5)")
+                print(f"     - Acceptance: {drafter_results['overall_acceptance_rate']:.1f}% (need >= 50%)")
+
+            print("="*70)
         else:
-            print("  ⚠️  P-EAGLE needs optimization")
-            print(f"     - Speedup: {speedup:.2f}x (need >= 1.5x)")
-            print(f"     - MAL: {drafter_results['mean_mal']:.2f} (need >= 1.5)")
-            print(f"     - Acceptance: {drafter_results['overall_acceptance_rate']:.1f}% (need >= 50%)")
-
-        print("="*70)
-
-    else:
-        # Drafter-only mode
-        print("\n" + "="*70)
-        print("  DRAFTER-ONLY EVALUATION SUMMARY")
-        print("="*70)
-        print(f"  Mean Acceptance Length (MAL): {drafter_results['mean_mal']:.2f}")
-        print(f"  Overall Acceptance Rate:     {drafter_results['overall_acceptance_rate']:.1f}%")
-        print(f"  Target Pass Efficiency:       {drafter_results['target_pass_efficiency']:.2f}")
-        print(f"  Mean TPS:                     {drafter_results['mean_tps']:.2f}")
+            # Drafter-only mode (no baseline comparison)
+            print("\n" + "="*70)
+            print("  DRAFTER-ONLY EVALUATION SUMMARY")
+            print("="*70)
+            print(f"  Mean Acceptance Length (MAL): {drafter_results['mean_mal']:.2f}")
+            print(f"  Overall Acceptance Rate:     {drafter_results['overall_acceptance_rate']:.1f}%")
+            print(f"  Target Pass Efficiency:       {drafter_results['target_pass_efficiency']:.2f}")
+            print(f"  Mean TPS:                     {drafter_results['mean_tps']:.2f}")
 
     # Remove raw tokens from results (they're large)
     if "baseline" in results and "_raw_tokens" in results["baseline"]:
         del results["baseline"]["_raw_tokens"]
-    if "_raw_tokens" in results["drafter"]:
+    if "drafter" in results and "_raw_tokens" in results["drafter"]:
         del results["drafter"]["_raw_tokens"]
 
     # Save results
