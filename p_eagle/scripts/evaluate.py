@@ -283,7 +283,7 @@ def evaluate_baseline(target_model_name: str, prompts: List[str], max_tokens: in
         tokenizer.pad_token = tokenizer.eos_token
 
     print(f"Loading {target_model_name} (quantization={quantization})...")
-    load_kwargs = {"device_map": "auto"}
+    load_kwargs = {"device_map": "cuda:0"}
     quant_config = _get_quant_config(quantization)
     if quant_config is not None:
         load_kwargs["quantization_config"] = quant_config
@@ -299,21 +299,21 @@ def evaluate_baseline(target_model_name: str, prompts: List[str], max_tokens: in
     all_generated_tokens = []  # For text equivalence comparison
 
     for i, prompt_item in enumerate(prompts):
-        print(f"  [{i+1}/{len(prompts)}] Generating...", end=" ", flush=True)
-
         # Handle both dict and string prompt formats
         prompt_text = prompt_item["prompt"] if isinstance(prompt_item, dict) else prompt_item
         input_ids = tokenizer.encode(prompt_text, return_tensors="pt").to(model.device)
         original_length = input_ids.shape[1]
 
+        # For temperature=0, use greedy decoding (do_sample=False)
+        use_greedy = temperature <= 0.0
         start = time.time()
         with torch.no_grad():
             output = model.generate(
                 input_ids,
                 max_new_tokens=max_tokens,
-                do_sample=True,
-                temperature=temperature,
-                top_p=top_p
+                do_sample=not use_greedy,
+                temperature=temperature if not use_greedy else 1.0,
+                top_p=top_p if not use_greedy else 1.0
             )
         elapsed = time.time() - start
 
@@ -335,13 +335,22 @@ def evaluate_baseline(target_model_name: str, prompts: List[str], max_tokens: in
             "time": elapsed,
             "tps": tps,
             "perplexity": perplexity,
-            "generated_text": tokenizer.decode(generated_ids)[:100]
+            "generated_text": tokenizer.decode(generated_ids)[:100],
+            # For baseline, these metrics are calculated but indicate no speculative decoding
+            "mal": 0.0,  # No drafts to accept in baseline
+            "target_pass_efficiency": float(tokens_generated) / float(tokens_generated) if tokens_generated > 0 else 0.0,  # 1.0 by definition
+            "verification_passes": tokens_generated,  # Each token requires one forward pass
         })
 
         total_time += elapsed
         total_tokens += tokens_generated
         all_perplexities.append(perplexity)
-        print(f"{tokens_generated} tokens, {elapsed:.2f}s, {tps:.1f} tps, ppl={perplexity:.2f}")
+
+        # Calculate baseline metrics properly
+        baseline_mal = 0.0  # No speculative decoding in baseline
+        baseline_eff = float(tokens_generated) / float(tokens_generated) if tokens_generated > 0 else 0.0
+
+        print(f"  [{i+1}/{len(prompts)}] Done: {tokens_generated} tokens, {elapsed:.2f}s, {tps:.1f} tps, MAL={baseline_mal:.2f}, eff={baseline_eff:.2f}, ppl={perplexity:.2f}")
 
     mean_tps = calculate_tps(total_tokens, total_time)
 
@@ -355,6 +364,9 @@ def evaluate_baseline(target_model_name: str, prompts: List[str], max_tokens: in
         "min_perplexity": np.min(all_perplexities) if all_perplexities else float('inf'),
         "max_perplexity": np.max(all_perplexities) if all_perplexities else float('inf'),
         "std_perplexity": np.std(all_perplexities) if all_perplexities else 0,
+        "mal": 0.0,  # No speculative decoding in baseline
+        "target_pass_efficiency": 1.0,  # 1 token per pass (no drafter)
+        "verification_passes": total_tokens,  # Each token requires one forward pass
         "samples": results,
         "_raw_tokens": all_generated_tokens  # For comparison with drafter
     }
@@ -393,7 +405,7 @@ def evaluate_speculative(drafter_checkpoint: str, target_model_name: str,
 
     # Load target model for verification (use same quantization as feature extraction)
     print(f"Loading target model: {target_model_name} (quantization={quantization})...")
-    load_kwargs = {"device_map": "auto"}
+    load_kwargs = {"device_map": "cuda:0"}
     quant_config = _get_quant_config(quantization)
     if quant_config is not None:
         load_kwargs["quantization_config"] = quant_config
@@ -406,7 +418,22 @@ def evaluate_speculative(drafter_checkpoint: str, target_model_name: str,
     print(f"Loading drafter from {drafter_checkpoint}...")
 
     # Check if drafter_checkpoint is a HuggingFace model ID or a local checkpoint
-    is_hf_model = "/" in drafter_checkpoint and not os.path.exists(drafter_checkpoint)
+    # A P-EAGLE checkpoint is either:
+    # 1. A directory containing model.pt or model.pth
+    # 2. A directory containing eagle_heads.pt (converted checkpoint format)
+    # 3. A direct .pt or .pth file
+    is_hf_model = True  # Default to HuggingFace model
+    if os.path.exists(drafter_checkpoint):
+        checkpoint_path = Path(drafter_checkpoint)
+        # Check if it's a directory with eagle_heads.pt (our converted format)
+        if (checkpoint_path / "eagle_heads.pt").exists() and (checkpoint_path / "config.json").exists():
+            is_hf_model = False
+        # Check if it's a directory with model.pt/model.pth
+        elif (checkpoint_path / "model.pt").exists() or (checkpoint_path / "model.pth").exists():
+            is_hf_model = False
+        # Check if it's a direct .pt or .pth file (but not model.pt in a directory)
+        elif checkpoint_path.is_file() and (checkpoint_path.suffix in ['.pt', '.pth']):
+            is_hf_model = False
 
     if is_hf_model:
         # For base model evaluation: we need to know the dimensions
@@ -421,14 +448,210 @@ def evaluate_speculative(drafter_checkpoint: str, target_model_name: str,
             target_hidden_dim=base_target_dim,
             speculation_depth=4,  # Use default K=4
             use_lora=False,
-            device="cuda",
+            device="cuda:0",
             use_hidden_injection=True,
             injection_mode="concat"
         )
         print(f"Created untrained drafter model with MTP heads for: {drafter_checkpoint}")
     else:
         # Load trained P-EAGLE checkpoint
-        drafter = EagleDrafterModel.load_checkpoint(drafter_checkpoint, device="cuda")
+        # First, check if it's a .pt file and needs conversion
+        import json
+        # Note: Path is already imported at the top of the file
+
+        checkpoint_path = Path(drafter_checkpoint)
+
+        # Check if path is a directory containing model.pt
+        model_pt_path = checkpoint_path / "model.pt"
+        model_pth_path = checkpoint_path / "model.pth"
+        needs_conversion = False
+
+        if checkpoint_path.is_dir():
+            if model_pt_path.exists():
+                # Directory containing model.pt
+                drafter_checkpoint = str(model_pt_path)
+                checkpoint_path = model_pt_path
+                needs_conversion = True
+                print(f"  Detected checkpoint directory with model.pt")
+            elif model_pth_path.exists():
+                drafter_checkpoint = str(model_pth_path)
+                checkpoint_path = model_pth_path
+                needs_conversion = True
+                print(f"  Detected checkpoint directory with model.pth")
+        elif drafter_checkpoint.endswith('.pt') or drafter_checkpoint.endswith('.pth'):
+            needs_conversion = True
+
+        # Handle .pt checkpoint files (convert to expected format)
+        if needs_conversion and checkpoint_path.exists():
+            print(f"  Converting checkpoint to expected format...")
+            pt_checkpoint = torch.load(drafter_checkpoint, map_location='cpu', weights_only=True)
+
+            # Handle different checkpoint formats
+            if 'model_state_dict' in pt_checkpoint and 'config' in pt_checkpoint:
+                state_dict = pt_checkpoint['model_state_dict']
+                config_data = pt_checkpoint['config']
+            elif 'model' in pt_checkpoint:
+                state_dict = pt_checkpoint['model']
+                config_data = pt_checkpoint.get('config', pt_checkpoint.get('args', {}))
+            else:
+                state_dict = pt_checkpoint
+                config_data = {}
+
+            # Create conversion directory
+            convert_dir = checkpoint_path.parent / f"{checkpoint_path.stem}_converted"
+            convert_dir.mkdir(parents=True, exist_ok=True)
+
+            # Create config.json
+            eval_config = {
+                "base_model": config_data.get('base_model', 'model_cache/gemma-3-4b-it'),
+                "target_hidden_dim": config_data.get('hidden_size', 2560),
+                "speculation_depth": config_data.get('speculation_depth', 1),
+                "use_hidden_injection": True,
+                "injection_mode": "concat"
+            }
+            with open(convert_dir / "config.json", "w") as f:
+                json.dump(eval_config, f, indent=2)
+
+            # Create eagle_heads.pt
+            eagle_heads = {}
+            # CRITICAL FIX: Use dim_projection (projects base_hidden -> target_hidden)
+            # NOT hidden_proj (old key name that doesn't match train_eagle3.py)
+            if 'hidden_proj.weight' in state_dict:
+                # Old checkpoint format - convert to new format
+                eagle_heads['dim_projection'] = {
+                    'weight': state_dict['hidden_proj.weight'],
+                    'bias': state_dict.get('hidden_proj.bias')
+                }
+            elif 'dim_projection.weight' in state_dict:
+                # New checkpoint format (from train_eagle3.py)
+                eagle_heads['dim_projection'] = {
+                    'weight': state_dict['dim_projection.weight'],
+                    'bias': state_dict.get('dim_projection.bias')
+                }
+            else:
+                print(f"  Warning: Could not find dim_projection/hidden_proj in checkpoint")
+
+            num_heads = len([k for k in state_dict.keys() if k.startswith('mtp_heads.')])
+            mtp_heads = []
+            for i in range(num_heads):
+                head_state = {}
+                for suffix in ['rescale', 'norm.weight', 'norm.bias', 'mlp.0.weight', 'mlp.0.bias', 'mlp.2.weight', 'mlp.2.bias']:
+                    key = f'mtp_heads.{i}.{suffix}'
+                    if key in state_dict:
+                        head_state[suffix] = state_dict[key]
+                if head_state:
+                    mtp_heads.append(head_state)
+            eagle_heads['mtp_heads'] = mtp_heads
+
+            # Load target_lm_head - check both old and new key names
+            # Old: head_projections.0.weight, New: target_lm_head.weight
+            if 'head_projections.0.weight' in state_dict:
+                eagle_heads['target_lm_head'] = {
+                    'weight': state_dict['head_projections.0.weight'],
+                    'bias': state_dict.get('head_projections.0.bias')
+                }
+            elif 'target_lm_head.weight' in state_dict:
+                # New checkpoint format (from train_eagle3.py)
+                eagle_heads['target_lm_head'] = {
+                    'weight': state_dict['target_lm_head.weight'],
+                    'bias': state_dict.get('target_lm_head.bias')
+                }
+
+            torch.save(eagle_heads, convert_dir / "eagle_heads.pt")
+            print(f"  Converted checkpoint saved to: {convert_dir}")
+            drafter_checkpoint = str(convert_dir)
+            checkpoint_path = convert_dir
+        elif not (checkpoint_path / "config.json").exists():
+            print(f"  Error: Checkpoint file not found or no config.json at: {drafter_checkpoint}")
+            return {}
+
+        config_path = checkpoint_path / "config.json"
+
+        self_speculative = False
+        if config_path.exists():
+            with open(config_path) as f:
+                ckpt_config = json.load(f)
+            # Check if base model matches target model
+            base_model_name = ckpt_config.get('base_model') or ''
+            target_model_name_short = target_model_name.split('/')[-1]
+            if target_model_name_short in base_model_name or base_model_name.endswith(target_model_name_short):
+                self_speculative = True
+
+        if self_speculative:
+            # Self-speculative decoding: base = target, reuse target model
+            print(f"  Self-speculative decoding detected, reusing target model as base")
+            # Get target model hidden size
+            if hasattr(target_model.config, 'hidden_size'):
+                base_hidden = target_model.config.hidden_size
+            else:
+                base_hidden = target_model.config.text_config.hidden_size
+
+            # NOTE: Do NOT pass base_model=target_model here!
+            # The drafter modifies its base_model's first layer by wrapping it with Eagle3FirstLayer.
+            # If target_model is passed, the target model becomes permanently modified and
+            # will fail when used for normal forward passes (expecting 2x hidden size input).
+            # We load a separate copy of the model for the drafter to preserve the target model.
+            print(f"  Loading separate copy for drafter (target model must remain unmodified)")
+            drafter = EagleDrafterModel(
+                base_model_name=ckpt_config.get('base_model', 'model_cache/gemma-3-4b-it'),
+                target_hidden_dim=ckpt_config.get('target_hidden_dim', base_hidden),
+                speculation_depth=ckpt_config.get('speculation_depth', 1),
+                use_lora=False,
+                device="cuda:0",
+                use_hidden_injection=ckpt_config.get('use_hidden_injection', True),
+                injection_mode=ckpt_config.get('injection_mode', 'concat'),
+                base_model=None  # Don't pass target_model - load a separate copy
+            )
+
+            # Load weights manually for self-speculative case
+            eagle_heads_path = Path(drafter_checkpoint) / "eagle_heads.pt"
+            if eagle_heads_path.exists():
+                print(f"  Loading weights from {eagle_heads_path}")
+                eagle_heads = torch.load(eagle_heads_path, map_location="cuda", weights_only=True)
+                drafter.dim_projection.load_state_dict(eagle_heads['dim_projection'])
+
+                # Load target_hidden_proj - this projects target_hidden to drafter's hidden dim for injection
+                # CRITICAL FIX: target_hidden_proj and dim_projection are DIFFERENT projections!
+                # - dim_projection: projects base hidden -> target hidden for MTP heads
+                # - target_hidden_proj: projects target hidden -> drafter hidden for injection
+                # For self-speculative (same hidden dims), target_hidden_proj should be IDENTITY
+                if hasattr(drafter, 'target_hidden_proj') and drafter.target_hidden_proj is not None:
+                    target_dim = ckpt_config.get('target_hidden_dim', 2560)
+                    drafter_dim = drafter.hidden_dim
+                    if target_dim == drafter_dim:
+                        # Self-speculative: target_hidden_proj should be identity
+                        # Initialize as identity matrix
+                        torch.nn.init.eye_(drafter.target_hidden_proj.weight)
+                        if drafter.target_hidden_proj.bias is not None:
+                            torch.nn.init.zeros_(drafter.target_hidden_proj.bias)
+                        print(f"  Initialized target_hidden_proj as identity (self-speculative)")
+                    else:
+                        # Different dimensions: might need to load projection (but not available in checkpoint)
+                        print(f"  Warning: target_hidden_proj uses random weights (different dims)")
+                else:
+                    print(f"  Note: target_hidden_proj not found in drafter")
+
+                for i, head_state in enumerate(eagle_heads['mtp_heads']):
+                    drafter.mtp_heads[i].load_state_dict(head_state)
+                # Load target_lm_head - create it if it doesn't exist in drafter
+                if 'target_lm_head' in eagle_heads:
+                    lm_head_state = eagle_heads['target_lm_head']
+                    vocab_size = lm_head_state["weight"].shape[0]
+                    hidden_size = lm_head_state["weight"].shape[1]
+                    # Check if checkpoint has bias - use same bias setting as training
+                    has_bias = 'bias' in lm_head_state and lm_head_state['bias'] is not None
+                    # Create target_lm_head with matching bias setting as training
+                    # CRITICAL FIX: Training (train_packed.py) creates with bias=False
+                    if not hasattr(drafter, 'target_lm_head') or drafter.target_lm_head is None:
+                        drafter.target_lm_head = torch.nn.Linear(
+                            hidden_size, vocab_size, bias=has_bias, dtype=torch.bfloat16, device="cuda:0"
+                        )
+                        print(f"  Created target_lm_head: {hidden_size} -> {vocab_size} (bias={has_bias})")
+                    drafter.target_lm_head.load_state_dict(lm_head_state, strict=False)
+                    print(f"  Loaded target_lm_head weights")
+                print(f"  Weights loaded successfully")
+        else:
+            drafter = EagleDrafterModel.load_checkpoint(drafter_checkpoint, device="cuda:0")
 
     drafter.eval()
 
@@ -458,28 +681,24 @@ def evaluate_speculative(drafter_checkpoint: str, target_model_name: str,
     if drafter_hidden_dim != target_hidden_dim:
         # Need to project drafter hidden to target hidden
         print(f"Creating projection: {drafter_hidden_dim} -> {target_hidden_dim}")
-        lm_head_projection = torch.nn.Linear(drafter_hidden_dim, target_hidden_dim, dtype=torch.bfloat16).to("cuda")
+        lm_head_projection = torch.nn.Linear(drafter_hidden_dim, target_hidden_dim, dtype=torch.bfloat16).to("cuda:0")
         # Load projection weights from drafter if available
+        # Note: drafter.target_hidden_proj maps target_hidden -> drafter_hidden (opposite direction)
+        # We need drafter_hidden -> target_hidden, so we can only copy transposed weights if shapes align
         if hasattr(drafter, 'target_hidden_proj'):
             with torch.no_grad():
-                src_weight = drafter.target_hidden_proj.weight
-                src_bias = drafter.target_hidden_proj.bias
-                # The drafter's projection maps target_hidden -> drafter_hidden
-                # We need the reverse: drafter_hidden -> target_hidden
-                # If shapes match after transpose, use them; otherwise init fresh
-                if src_weight.shape == (target_hidden_dim, drafter_hidden_dim):
-                    lm_head_projection.weight.copy_(src_weight)
-                elif src_weight.t().shape == lm_head_projection.weight.shape:
+                src_weight = drafter.target_hidden_proj.weight  # Shape: (drafter_hidden, target_hidden)
+                # Try to copy transposed weights if shape matches
+                if src_weight.t().shape == lm_head_projection.weight.shape:
                     lm_head_projection.weight.copy_(src_weight.t())
+                    print(f"  Loaded transposed projection weights")
                 else:
-                    print(f"  Warning: projection shape mismatch ({src_weight.shape} vs {lm_head_projection.weight.shape}), using fresh init")
-                if src_bias is not None:
-                    lm_head_projection.bias.copy_(src_bias)
-        print(f"Loaded projection weights: {drafter_hidden_dim} -> {target_hidden_dim}")
+                    print(f"  Using fresh projection weights (shape mismatch)")
+        print(f"Created projection: {drafter_hidden_dim} -> {target_hidden_dim}")
     else:
         # Same dimensions - use identity mapping
         print("Same hidden dimensions - using identity projection")
-        lm_head_projection = torch.nn.Identity().to("cuda")
+        lm_head_projection = torch.nn.Identity().to("cuda:0")
 
     speculation_depth = drafter.speculation_depth
     print(f"Speculation depth (K): {speculation_depth}")
@@ -499,7 +718,7 @@ def evaluate_speculative(drafter_checkpoint: str, target_model_name: str,
 
         # Handle both dict and string prompt formats
         prompt_text = prompt_item["prompt"] if isinstance(prompt_item, dict) else prompt_item
-        input_ids = tokenizer.encode(prompt_text, return_tensors="pt").to("cuda")
+        input_ids = tokenizer.encode(prompt_text, return_tensors="pt").to("cuda:0")
         original_length = input_ids.shape[1]
         generated = input_ids.clone()
 
@@ -527,10 +746,16 @@ def evaluate_speculative(drafter_checkpoint: str, target_model_name: str,
                 mtp_predictions = drafter_outputs["mtp_predictions"]
 
             # Convert hidden states to K draft tokens
+            # CRITICAL FIX: Use TARGET model's lm_head with proper projection!
+            # The drafter produces hidden states in its own hidden space (640 for gemma-3-270m).
+            # We must project to target's hidden space (2560 for gemma-3-4b) before using target_lm_head!
             draft_tokens = []
             for k in range(min(speculation_depth, max_tokens - (generated.shape[1] - original_length))):
-                pred_hidden = mtp_predictions[k]
-                logits = target_lm_head(pred_hidden[:, -1:, :])
+                pred_hidden = mtp_predictions[k]  # [1, seq_len, drafter_hidden_dim]
+                # Project from drafter's hidden space to target's hidden space
+                projected_hidden = lm_head_projection(pred_hidden[:, -1:, :])  # [1, 1, target_hidden_dim]
+                # Then use target model's lm_head to get logits
+                logits = target_lm_head(projected_hidden.to(target_lm_head.weight.dtype))
                 token_id = torch.argmax(logits, dim=-1).item()
                 draft_tokens.append(token_id)
 
@@ -538,18 +763,23 @@ def evaluate_speculative(drafter_checkpoint: str, target_model_name: str,
                 break
 
             # Step 2: Target verifies ALL drafts in parallel
-            draft_tensor = torch.tensor([draft_tokens], device="cuda")
+            draft_tensor = torch.tensor([draft_tokens], device="cuda:0")
             verify_input = torch.cat([generated, draft_tensor], dim=1)
             num_verification_passes += 1
 
             with torch.no_grad():
                 verify_outputs = target_model(verify_input, output_hidden_states=True)
+                # CRITICAL FIX: For causal LM, logits[p] predicts token at position p+1
+                # Draft tokens are at positions [generated.shape[1], ..., generated.shape[1]+3]
+                # We need logits at positions [generated.shape[1]-1, ..., generated.shape[1]+2]
+                # which predict tokens at positions [generated.shape[1], ..., generated.shape[1]+3]
                 verify_logits = verify_outputs.logits[0, generated.shape[1]-1:, :]
                 verify_hidden = verify_outputs.hidden_states[-1]  # [1, verify_len, target_hidden_dim]
 
             # Step 3: Accept/reject tokens
             accepted_count = 0
             for j, draft_token in enumerate(draft_tokens):
+                # verify_logits[j] predicts token at position generated.shape[1] + j
                 target_token = torch.argmax(verify_logits[j]).item()
                 if draft_token == target_token:
                     accepted_count += 1
@@ -566,14 +796,14 @@ def evaluate_speculative(drafter_checkpoint: str, target_model_name: str,
 
             # Append accepted tokens
             if accepted_count > 0:
-                new_tokens = torch.tensor([[draft_tokens[i] for i in range(accepted_count)]], device="cuda")
+                new_tokens = torch.tensor([[draft_tokens[i] for i in range(accepted_count)]], device="cuda:0")
                 generated = torch.cat([generated, new_tokens], dim=1)
                 acceptance_counts.append(accepted_count)
                 total_drafted += len(draft_tokens)
             else:
                 # All rejected - target generates one token
                 fallback_token = torch.argmax(verify_logits[0]).item()
-                new_token = torch.tensor([[fallback_token]], device="cuda")
+                new_token = torch.tensor([[fallback_token]], device="cuda:0")
                 generated = torch.cat([generated, new_token], dim=1)
                 acceptance_counts.append(0)
                 total_drafted += len(draft_tokens)
@@ -591,9 +821,14 @@ def evaluate_speculative(drafter_checkpoint: str, target_model_name: str,
         all_mal.append(mal)
 
         # Calculate perplexity
+        # BUG FIX: logits at position t predict token at t+1 (causal LM)
+        # So logits[original_length-1] predicts generated token at position original_length
+        # We need logits from original_length-1 to original_length+tokens_generated-2 (inclusive)
+        # which is slice [original_length-1:original_length+tokens_generated-1]
+        # The old code used [original_length-1:-1] which caused off-by-one errors
         with torch.no_grad():
             full_output = target_model(generated)
-            logits = full_output.logits[0, original_length-1:-1]
+            logits = full_output.logits[0, original_length-1:original_length+tokens_generated-1]
             if len(generated_ids) > 0 and logits.shape[0] > 0:
                 perplexity = calculate_perplexity(logits, generated[0, original_length:])
             else:
@@ -621,8 +856,7 @@ def evaluate_speculative(drafter_checkpoint: str, target_model_name: str,
 
         total_verification_passes += num_verification_passes
 
-        print(f"{tokens_generated} tokens, MAL={mal:.2f}, {tps:.1f} tps, "
-              f"eff={sample_efficiency:.2f}, ppl={perplexity:.2f}")
+        print(f"Done: {tokens_generated} tokens, {elapsed:.2f}s, {tps:.1f} tps, MAL={mal:.2f}, eff={sample_efficiency:.2f}, ppl={perplexity:.2f}")
 
     # Calculate aggregate metrics using helper functions
     mean_tps = calculate_tps(sum(r["tokens"] for r in results), sum(r["time"] for r in results))
@@ -691,7 +925,7 @@ Examples:
     parser.add_argument("--top_p", type=float, default=0.9)
     parser.add_argument("--quantization", default="none", choices=["4bit", "8bit", "none"],
                        help="Quantization for target model (must match feature extraction)")
-    parser.add_argument("--baseline", action="store_true", default=True,
+    parser.add_argument("--baseline", action="store_true", default=False,
                        help="Also evaluate baseline (no drafter)")
     parser.add_argument("--output", default="eval_results.json",
                        help="Output file for results")
@@ -875,6 +1109,7 @@ Examples:
             print(f"  Mean Acceptance Length (MAL): {drafter_results['mean_mal']:.2f}")
             print(f"  Overall Acceptance Rate:     {drafter_results['overall_acceptance_rate']:.1f}%")
             print(f"  Target Pass Efficiency:       {drafter_results['target_pass_efficiency']:.2f}")
+            print(f"  Mean Perplexity (PPL):         {drafter_results['mean_perplexity']:.2f}")
             print(f"  Mean TPS:                     {drafter_results['mean_tps']:.2f}")
 
     # Remove raw tokens from results (they're large)

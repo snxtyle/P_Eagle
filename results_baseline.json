@@ -1,0 +1,106 @@
+{
+  "config": {
+    "drafter_checkpoint": null,
+    "target_model": "model_cache/gemma-3-4b-it",
+    "test_prompts": null,
+    "max_tokens": 500,
+    "temperature": 0.0,
+    "top_p": 0.9,
+    "quantization": "none",
+    "baseline": true,
+    "output": "results_baseline.json"
+  },
+  "baseline": {
+    "model": "model_cache/gemma-3-4b-it",
+    "total_samples": 10,
+    "total_tokens": 4701,
+    "total_time": 184.02056908607483,
+    "mean_tps": 25.546057287765084,
+    "mean_perplexity": 1.21875,
+    "min_perplexity": 1.046875,
+    "max_perplexity": 1.328125,
+    "std_perplexity": 0.07598635259867392,
+    "samples": [
+      {
+        "prompt": "Explain how payment processing works in 3 steps.",
+        "tokens": 201,
+        "time": 13.60977292060852,
+        "tps": 14.768798948558276,
+        "perplexity": 1.2265625,
+        "generated_text": "\n\n1.  **Transaction Initiation:** A customer initiates a payment by providing their payment informat"
+      },
+      {
+        "prompt": "What are common causes of SDK integration failures?",
+        "tokens": 500,
+        "time": 27.546294450759888,
+        "tps": 18.151261720293093,
+        "perplexity": 1.328125,
+        "generated_text": "\n\nSDK integration failures can be incredibly frustrating, leading to delays and impacting user exper"
+      },
+      {
+        "prompt": "Summarize the key metrics for monitoring payment health.",
+        "tokens": 500,
+        "time": 17.846965074539185,
+        "tps": 28.01596786409973,
+        "perplexity": 1.2734375,
+        "generated_text": "\n\nHere's a summary of key metrics for monitoring payment health, categorized for clarity:\n\n**1. Volu"
+      },
+      {
+        "prompt": "Describe the difference between synchronous and asynchronous callbacks.",
+        "tokens": 500,
+        "time": 17.647566318511963,
+        "tps": 28.332518545376395,
+        "perplexity": 1.1484375,
+        "generated_text": "\n\n**Synchronous Callbacks**\n\n*   **Definition:** In synchronous programming, a callback is executed "
+      },
+      {
+        "prompt": "How would you troubleshoot a timeout error in a payment gateway?",
+        "tokens": 500,
+        "time": 17.881633758544922,
+        "tps": 27.96165086207908,
+        "perplexity": 1.2890625,
+        "generated_text": "\n\nTroubleshooting a timeout error in a payment gateway can be a frustrating experience, but a system"
+      },
+      {
+        "prompt": "Write a short Python function to validate credit card numbers.",
+        "tokens": 500,
+        "time": 17.677904844284058,
+        "tps": 28.283894749081032,
+        "perplexity": 1.046875,
+        "generated_text": "\n\n```python\ndef validate_credit_card(card_number):\n  \"\"\"\n  Validates a credit card number.\n\n  Args:\n"
+      },
+      {
+        "prompt": "What is the difference between idempotent and non-idempotent API calls?",
+        "tokens": 500,
+        "time": 18.18955683708191,
+        "tps": 27.48830026362607,
+        "perplexity": 1.265625,
+        "generated_text": "\n\n**Idempotent API Calls**\n\n*   **Definition:** An idempotent API call is one that can be called mul"
+      },
+      {
+        "prompt": "Explain WebSocket connections and their use cases.",
+        "tokens": 500,
+        "time": 17.693182945251465,
+        "tps": 28.259471546027907,
+        "perplexity": 1.1953125,
+        "generated_text": "\n\n## WebSocket Connections Explained\n\nWebSocket is a communication protocol that provides full-duple"
+      },
+      {
+        "prompt": "How does 2FA improve payment security?",
+        "tokens": 500,
+        "time": 17.976750135421753,
+        "tps": 27.813703602342997,
+        "perplexity": 1.21875,
+        "generated_text": "\n\nTwo-Factor Authentication (2FA) significantly improves payment security by adding an extra layer o"
+      },
+      {
+        "prompt": "Describe the payment gateway authorization flow.",
+        "tokens": 500,
+        "time": 17.950941801071167,
+        "tps": 27.853691775111436,
+        "perplexity": 1.1953125,
+        "generated_text": "\n\nThe payment gateway authorization flow is a critical process that ensures a secure and reliable tr"
+      }
+    ]
+  }
+}

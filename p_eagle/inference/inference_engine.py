@@ -45,12 +45,24 @@ def run_inference(
     target_model.eval()
 
     # Get target's lm_head for converting hidden states to tokens
-    if hasattr(target_model, 'lm_head'):
-        target_lm_head_fallback = target_model.lm_head
-    elif hasattr(target_model, 'model') and hasattr(target_model.model, 'lm_head'):
-        target_lm_head_fallback = target_model.model.lm_head
-    else:
-        raise ValueError("Could not find lm_head in target model")
+    # Try multiple locations (Gemma-3 multimodal models use model.model.language_model.lm_head)
+    target_lm_head_fallback = None
+    lm_head_locations = [
+        ("target_model.lm_head", lambda m: m if hasattr(m, 'lm_head') and m.lm_head is not None else None),
+        ("target_model.model.lm_head", lambda m: m.model if hasattr(m, 'model') and hasattr(m.model, 'lm_head') and m.model.lm_head is not None else None),
+        ("target_model.model.language_model.lm_head", lambda m: m.model.language_model if hasattr(m, 'model') and hasattr(m.model, 'language_model') and hasattr(m.model.language_model, 'lm_head') else None),
+        ("target_model.language_model.lm_head", lambda m: m.language_model if hasattr(m, 'language_model') and hasattr(m.language_model, 'lm_head') else None),
+    ]
+
+    for location_name, check_func in lm_head_locations:
+        lm_obj = check_func(target_model)
+        if lm_obj is not None:
+            target_lm_head_fallback = lm_obj
+            print(f"  Found target lm_head at {location_name} (vocab: {target_lm_head_fallback.weight.shape[0]})")
+            break
+
+    if target_lm_head_fallback is None:
+        raise ValueError("Could not find lm_head in target model at any known location")
 
     print(f"Loading P-EAGLE drafter: {drafter_checkpoint}")
     drafter = EagleDrafterModel.load_checkpoint(drafter_checkpoint, device=device)

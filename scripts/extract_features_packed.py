@@ -1,44 +1,38 @@
 #!/usr/bin/env python3
 """
-P-EAGLE FlashAttention-Compatible Feature Extraction
+P-EAGLE Hidden State Extraction
 
-Extracts hidden states from packed sequences for H200 training.
-Uses FlashAttention varlen format for maximum GPU efficiency.
+Loads pre-tokenized sequences from packed_features_5k/ and extracts
+hidden states from Gemma-3.
+
+IMPORTANT: This script processes data that was already tokenized with
+apply_chat_template() in fast_sequence_packing.py. Do NOT re-apply
+chat template - the data is already formatted correctly!
 
 Usage:
-    # Phase 1: Extract 5K samples
     python scripts/extract_features_packed.py \
-        --model_path meta-llama/Llama-3.1-8B \
-        --input_dir data/packed_5k \
-        --output_dir data/features_packed_5k \
-        --batch_size 8
-
-    # Phase 2: Extract 10K samples
-    python scripts/extract_features_packed.py \
-        --model_path meta-llama/Llama-3.1-8B \
-        --input_dir data/packed_10k \
-        --output_dir data/features_packed_10k
-
-    # Phase 3: Full extraction
-    python scripts/extract_features_packed.py \
-        --model_path meta-llama/Llama-3.1-8B \
-        --input_dir data/packed_full \
-        --output_dir data/features_packed_full
+        --input data/packed_features_5k \
+        --output data/features_packed_5k \
+        --model google/gemma-3-4b-it \
+        --shard_size 500
 """
 
 import argparse
 import json
+import os
 import torch
-import torch.nn.functional as F
-from pathlib import Path
-from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig
-from tqdm import tqdm
 import gc
+from pathlib import Path
+from typing import List, Dict, Optional, Tuple
+from tqdm import tqdm
+from dataclasses import dataclass
+
+import torch.nn.functional as F
 
 
-def load_packed_dataset(input_dir):
-    """Load all packed sequence shards from directory."""
-    shards = sorted(Path(input_dir).glob("*.pt"))
+def load_packed_dataset(input_dir: str) -> List[Dict]:
+    """Load all packed sequence shards."""
+    shards = sorted(Path(input_dir).glob("packed_shard_*.pt"))
     if not shards:
         raise ValueError(f"No packed shards found in {input_dir}")
 
@@ -51,208 +45,166 @@ def load_packed_dataset(input_dir):
     return all_data
 
 
-def extract_features_batch(model, input_ids, cu_seqlens, block_size=4096):
+def extract_hidden_states_single(
+    model,
+    input_ids: torch.Tensor,
+    device: str = 'cuda'
+) -> Tuple[torch.Tensor, torch.Tensor]:
     """
-    Extract hidden states using FlashAttention-compatible batching.
+    Extract hidden states for a single sequence.
+    Memory-efficient: disables KV cache and clears GPU memory.
 
-    For H200, we want:
-    1. Process multiple 4096-blocks in parallel
-    2. Use attention_mask with cu_seqlens for variable-length handling
-    3. Extract last layer hidden states (required for speculative decoding alignment)
+    input_ids: [seq_len] token IDs
+    Returns: (hidden_states [seq_len, hidden_dim], target_ids [seq_len])
     """
-    device = next(model.parameters()).device
-    batch_size = len(cu_seqlens) - 1  # Number of sequences
-    max_seq_len = block_size
+    input_ids = input_ids.unsqueeze(0).to(device)  # [1, seq_len]
+    seq_len = input_ids.shape[1]
 
-    # Pad to multiple of block_size for efficient processing
-    total_len = len(input_ids)
-    padded_len = ((total_len + block_size - 1) // block_size) * block_size
-    pad_len = padded_len - total_len
-
-    # Create padded input
-    padded_input_ids = torch.zeros(padded_len, dtype=torch.long, device=device)
-    padded_input_ids[:total_len] = input_ids.to(device)
-
-    # Create attention mask (1 for real tokens, 0 for padding)
-    attention_mask = torch.zeros(padded_len, dtype=torch.long, device=device)
-    attention_mask[:total_len] = 1
-
-    # Convert cu_seqlens to device
-    cu_seqlens = cu_seqlens.to(device)
-
-    # Run model with FlashAttention-compatible attention
-    with torch.no_grad():
+    # Disable KV cache to prevent memory accumulation
+    with torch.no_grad(), torch.amp.autocast('cuda', dtype=torch.bfloat16):
         outputs = model(
-            input_ids=padded_input_ids.unsqueeze(0),  # Add batch dim
-            attention_mask=attention_mask.unsqueeze(0),
-            output_hidden_states=True
+            input_ids=input_ids,
+            output_hidden_states=True,
+            use_cache=False  # Disable KV cache to save memory
         )
 
-    # Get last layer hidden states
-    hidden_states = outputs.hidden_states[-1][0]  # [seq_len, hidden_dim]
+    # Get last hidden states [1, seq_len, hidden_dim] -> [seq_len, hidden_dim]
+    hidden_states = outputs.hidden_states[-1][0].float().cpu()
 
-    # Trim to actual length
-    hidden_states = hidden_states[:total_len]
+    # Create target tokens (next token prediction) - shift by 1
+    target_ids = input_ids[0].cpu().roll(-1)
+    target_ids[-1] = 0  # Padding at end
 
-    return hidden_states.cpu()
+    # Clear GPU cache after each sequence to prevent OOM
+    torch.cuda.empty_cache()
 
-
-def compute_target_token_ids_batch(model, input_ids):
-    """Compute target token IDs (argmax of logits) for each position."""
-    device = next(model.parameters()).device
-
-    with torch.no_grad():
-        outputs = model(input_ids=input_ids.to(device).unsqueeze(0))
-        logits = outputs.logits[0]  # [seq_len, vocab_size]
-        target_ids = logits.argmax(dim=-1).cpu()
-
-    return target_ids
+    return hidden_states, target_ids
 
 
-def main():
-    parser = argparse.ArgumentParser(description="P-EAGLE FlashAttention Feature Extraction")
-    parser.add_argument("--model_path", required=True, help="Target model path")
-    parser.add_argument("--tokenizer_path", default=None,
-                        help="Tokenizer (defaults to model_path)")
-    parser.add_argument("--input_dir", required=True,
-                        help="Directory with packed sequences")
-    parser.add_argument("--output_dir", required=True,
-                        help="Output directory for features")
-    parser.add_argument("--quantization", default="8bit",
-                        choices=["4bit", "8bit", "none"],
-                        help="Model quantization")
-    parser.add_argument("--batch_size", type=int, default=8,
-                        help="Batch size for processing")
-    parser.add_argument("--block_size", type=int, default=4096,
-                        help="Sequence block size")
-    parser.add_argument("--layers", default="last",
-                        help="Layer extraction mode: 'last', 'all', or comma-separated indices")
-    parser.add_argument("--shard_size", type=int, default=1000,
-                        help="Samples per output shard")
+def create_loss_mask(input_ids: torch.Tensor, tokenizer) -> torch.Tensor:
+    """
+    Create loss mask - marks where to calculate loss.
 
-    args = parser.parse_args()
+    Masks: BOS, EOS, PAD, control tokens
+    """
+    loss_mask = torch.ones_like(input_ids, dtype=torch.float32)
 
-    # Setup paths
-    output_dir = Path(args.output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
+    # Special tokens to mask
+    mask_ids = set()
+    mask_ids.add(tokenizer.bos_token_id)
+    mask_ids.add(tokenizer.eos_token_id)
+    mask_ids.add(tokenizer.pad_token_id)
+    if tokenizer.unk_token_id:
+        mask_ids.add(tokenizer.unk_token_id)
 
-    # Load tokenizer
-    tokenizer_path = args.tokenizer_path or args.model_path
-    print(f"Loading tokenizer: {tokenizer_path}")
-    tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
+    # Gemma-3 control tokens
+    control_tokens = ['<start_of_turn>', '<end_of_turn>']
+    for tok in control_tokens:
+        ids = tokenizer.encode(tok, add_special_tokens=False)
+        mask_ids.update(ids)
 
-    # Load model
-    print(f"Loading model: {args.model_path}")
-    load_kwargs = {"low_cpu_mem_usage": True}
+    for i, tid in enumerate(input_ids):
+        if tid.item() in mask_ids:
+            loss_mask[i] = 0.0
 
-    if args.quantization == "4bit":
-        load_kwargs["quantization_config"] = BitsAndBytesConfig(
-            load_in_4bit=True,
-            bnb_4bit_compute_dtype=torch.bfloat16,
-            bnb_4bit_use_double_quant=True,
-            bnb_4bit_quant_type="nf4"
-        )
-    elif args.quantization == "8bit":
-        load_kwargs["quantization_config"] = BitsAndBytesConfig(load_in_8bit=True)
-    else:
-        load_kwargs["torch_dtype"] = torch.bfloat16
+    return loss_mask
 
-    # Check for HF token
-    HF_TOKEN = None
-    try:
-        from dotenv import load_dotenv
-        load_dotenv()
-        HF_TOKEN = os.getenv("HUGGINGFACE_TOKEN") or os.getenv("HF_TOKEN")
-    except ImportError:
-        pass
 
-    if HF_TOKEN:
-        load_kwargs["token"] = HF_TOKEN
+def process_packed_sequences(
+    model,
+    tokenizer,
+    packed_data: List[Dict],
+    output_dir: Path,
+    shard_size: int = 500,
+    max_seq_len: int = 4096
+):
+    """
+    Process packed sequences and extract hidden states.
 
-    model = AutoModelForCausalLM.from_pretrained(args.model_path, **load_kwargs)
-    model.eval()
-
-    # Move to CUDA
-    if torch.cuda.is_available():
-        model = model.to("cuda")
-        torch.cuda.synchronize()
-        print(f"Model on: {next(model.parameters()).device}")
-
-    # Determine layer indices
-    num_layers = model.config.num_hidden_layers
-    if args.layers == "last":
-        layer_indices = [-1]
-    elif args.layers == "all":
-        layer_indices = list(range(num_layers))
-    else:
-        layer_indices = [int(x) for x in args.layers.split(",")]
-
-    print(f"Extracting layers: {layer_indices}")
-
-    # Load packed data
-    print(f"Loading packed sequences from {args.input_dir}")
-    packed_data = load_packed_dataset(args.input_dir)
-
-    # Process each shard
+    Each packed sequence has:
+    - input_ids: [max_seq_len] token IDs (padded)
+    - loss_mask: [max_seq_len] 0/1 mask
+    - cu_seqlens: cumulative sequence lengths within the packed block
+    """
     all_features = []
+    total_samples = 0
     shard_idx = 0
 
     for shard_data in tqdm(packed_data, desc="Processing shards"):
-        input_ids = shard_data["input_ids"]
-        loss_mask = shard_data["loss_mask"]
-        cu_seqlens = shard_data["cu_seqlens"]
-        total_tokens = shard_data["total_tokens"]
+        input_ids = shard_data["input_ids"]  # [N, max_seq_len]
+        loss_mask = shard_data["loss_mask"]   # [N, max_seq_len]
+        cu_seqlens_list = shard_data["cu_seqlens"]  # list of tensors
 
-        print(f"\nProcessing shard {shard_idx}: {total_tokens:,} tokens, {len(cu_seqlens)-1} sequences")
+        N = input_ids.shape[0]
 
-        # Extract hidden states
-        hidden_states = extract_features_batch(
-            model, input_ids, cu_seqlens, args.block_size
-        )
+        for seq_idx in tqdm(range(N), desc=f"Shard {shard_idx}"):
+            ids = input_ids[seq_idx].long()
+            mask = loss_mask[seq_idx]
 
-        # Compute target token IDs
-        target_token_ids = compute_target_token_ids_batch(model, input_ids)
+            # Skip all-padding sequences
+            if (ids == 0).all():
+                continue
 
-        # Create feature entries for each sequence in the shard
-        for i in range(len(cu_seqlens) - 1):
-            start = cu_seqlens[i].item()
-            end = cu_seqlens[i + 1].item()
+            # Extract hidden states
+            try:
+                hidden, targets = extract_hidden_states_single(model, ids)
 
-            feature = {
-                "input_ids": input_ids[start:end],
-                "hidden_states": hidden_states[start:end],
-                "loss_mask": loss_mask[start:end],
-                "target_token_ids": target_token_ids[start:end],
-            }
+                # Use the loss_mask from packed data (already correct!)
+                # No need to re-create it
 
-            all_features.append(feature)
+                # Get cu_seqlens for this sequence (conversation boundaries)
+                seq_cu_seqlens = cu_seqlens_list[seq_idx]
 
-            # Save shards periodically
-            if len(all_features) >= args.shard_size:
-                _save_shard(all_features, output_dir, shard_idx, tokenizer)
-                shard_idx += 1
-                all_features = []
+                all_features.append({
+                    "input_ids": ids,
+                    "hidden_states": hidden,
+                    "target_token_ids": targets,
+                    "loss_mask": mask,
+                    "cu_seqlens": seq_cu_seqlens,  # Preserve conversation tracking
+                })
 
-        del hidden_states
+                total_samples += 1
+
+                # Save shard more frequently to prevent data loss
+                if len(all_features) >= shard_size:
+                    save_shard(all_features, output_dir / f"features_shard_{shard_idx:04d}.pt")
+                    print(f"  Saved shard {shard_idx}: {len(all_features)} samples")
+                    all_features = []
+                    shard_idx += 1
+                    # Clear GPU cache after saving each shard
+                    torch.cuda.empty_cache()
+
+                # Check memory usage every 100 sequences
+                if total_samples % 100 == 0:
+                    mem_allocated = torch.cuda.memory_allocated() / 1e9
+                    mem_reserved = torch.cuda.memory_reserved() / 1e9
+                    print(f"  Progress: {total_samples} samples, GPU memory: {mem_allocated:.1f}GB / {mem_reserved:.1f}GB")
+
+            except Exception as e:
+                print(f"Error processing sequence {seq_idx}: {e}")
+                # Try to recover by clearing cache
+                torch.cuda.empty_cache()
+                continue
+
+        del input_ids, loss_mask
         gc.collect()
-        torch.cuda.empty_cache()
 
-    # Save final shard
+    # Save remaining
     if all_features:
-        _save_shard(all_features, output_dir, shard_idx, tokenizer)
+        save_shard(all_features, output_dir / f"features_shard_{shard_idx:04d}.pt")
+        print(f"  Saved final shard {shard_idx}: {len(all_features)} samples")
 
-    print(f"\nExtraction complete! Output: {output_dir}")
+    return total_samples
 
 
-def _save_shard(features, output_dir, shard_idx, tokenizer):
+def save_shard(features: List[Dict], path: Path):
     """Save a shard of extracted features."""
+    # input_ids should be int64 (token IDs), NOT bfloat16!
     input_ids = torch.nn.utils.rnn.pad_sequence(
         [f["input_ids"] for f in features],
         batch_first=True,
-        padding_value=tokenizer.pad_token_id or 0
-    ).to(torch.bfloat16)
+        padding_value=0
+    ).to(torch.int64)  # FIX: Keep as int64!
 
     hidden_states = torch.nn.utils.rnn.pad_sequence(
         [f["hidden_states"] for f in features],
@@ -272,19 +224,90 @@ def _save_shard(features, output_dir, shard_idx, tokenizer):
         padding_value=-100
     )
 
-    output_file = output_dir / f"features_shard_{shard_idx:04d}.pt"
+    # Save cu_seqlens for each sequence
+    cu_seqlens_list = [f["cu_seqlens"] for f in features]
 
     torch.save({
         "input_ids": input_ids,
         "hidden_states": hidden_states,
         "loss_mask": loss_masks,
         "target_token_ids": target_ids,
+        "cu_seqlens": cu_seqlens_list,  # Preserve conversation tracking
         "num_samples": len(features)
-    }, output_file)
-
-    print(f"  Saved {output_file}: {len(features)} samples")
+    }, path)
 
 
-if __name__ == "__main__":
-    import os
+def main():
+    parser = argparse.ArgumentParser(description='P-EAGLE Hidden State Extraction')
+    parser.add_argument('--input', type=str, required=True,
+                        help='Input directory with packed sequences (packed_features_5k/)')
+    parser.add_argument('--output', type=str, required=True,
+                        help='Output directory for features')
+    parser.add_argument('--model', type=str, default='google/gemma-3-4b-it',
+                        help='Gemma-3 model path/name')
+    parser.add_argument('--shard_size', type=int, default=500,
+                        help='Samples per output shard')
+    parser.add_argument('--max_seq_len', type=int, default=4096,
+                        help='Max sequence length')
+    parser.add_argument('--batch_size', type=int, default=1,
+                        help='Batch size for inference (currently only 1 supported)')
+
+    args = parser.parse_args()
+
+    from transformers import AutoTokenizer, AutoModelForCausalLM
+
+    print("=" * 60)
+    print("P-EAGLE Hidden State Extraction")
+    print("Loading from pre-tokenized packed sequences")
+    print("=" * 60)
+
+    # Create output directory
+    output_dir = Path(args.output)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    # Load tokenizer (for loss mask creation if needed)
+    print(f"\n[1/4] Loading tokenizer: {args.model}")
+    tokenizer = AutoTokenizer.from_pretrained(args.model)
+    print(f"  Vocab size: {tokenizer.vocab_size}")
+
+    # Load model
+    print(f"\n[2/4] Loading model: {args.model}")
+    model = AutoModelForCausalLM.from_pretrained(
+        args.model,
+        device_map='cuda',
+        torch_dtype=torch.bfloat16,
+        trust_remote_code=True,
+    )
+    model.eval()
+    print(f"  Model loaded on GPU")
+
+    # Load packed data
+    print(f"\n[3/4] Loading packed sequences: {args.input}")
+    packed_data = load_packed_dataset(args.input)
+
+    # Process
+    print(f"\n[4/4] Extracting hidden states...")
+    total_samples = process_packed_sequences(
+        model, tokenizer, packed_data, output_dir,
+        shard_size=args.shard_size, max_seq_len=args.max_seq_len
+    )
+
+    # Cleanup
+    del model
+    gc.collect()
+    torch.cuda.empty_cache()
+
+    print(f"\n{'=' * 60}")
+    print("COMPLETE!")
+    print(f"{'=' * 60}")
+    print(f"Total samples processed: {total_samples}")
+    print(f"Output directory: {args.output}")
+
+    # Verify output
+    if output_dir.exists():
+        shards = list(output_dir.glob("features_shard_*.pt"))
+        print(f"Generated {len(shards)} shard files")
+
+
+if __name__ == '__main__':
     main()

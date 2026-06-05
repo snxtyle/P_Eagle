@@ -370,10 +370,20 @@ class FeatureExtractor:
                 }
 
             def _norm_last_layer(hs):
-                if hasattr(self.model, 'model') and hasattr(self.model.model, 'norm'):
+                # Gemma 3 multimodal: model.language_model.norm
+                if hasattr(self.model, 'language_model') and hasattr(self.model.language_model, 'norm'):
+                    return self.model.language_model.norm(hs)
+                # Standard: model.model.norm (e.g., Llama, Mistral)
+                elif hasattr(self.model, 'model') and hasattr(self.model.model, 'norm'):
                     return self.model.model.norm(hs)
+                # Some models: model.norm
                 elif hasattr(self.model, 'norm'):
                     return self.model.norm(hs)
+                # Gemma 2: model.model.language_model.norm
+                elif hasattr(self.model, 'model') and hasattr(self.model.model, 'language_model') and hasattr(self.model.model.language_model, 'norm'):
+                    return self.model.model.language_model.norm(hs)
+                # Fallback: return as-is (no normalization)
+                # WARNING: This may cause training issues - ideally the model should have a final norm
                 return hs
 
             if full_seq_len <= self.max_length:
@@ -650,11 +660,39 @@ class FeatureExtractor:
         output_file = self.output_dir / f"{input_name}_shard{shard_idx:04d}.pt"
 
         # Save target model's lm_head weights for perfect KL alignment during training
+        # CRITICAL FIX: We need to try multiple locations and handle errors
         lm_head_state = None
-        if hasattr(self.model, 'lm_head'):
-            lm_head_state = self.model.lm_head.state_dict()
-        elif hasattr(self.model, 'model') and hasattr(self.model.model, 'lm_head'):
-            lm_head_state = self.model.model.lm_head.state_dict()
+        lm_head_found = False
+
+        # Try multiple locations where lm_head might be stored
+        # IMPORTANT: Gemma-3 multimodal models (like gemma-3-4b-it) use model.model.language_model.lm_head
+        locations_to_check = [
+            ("self.model.lm_head", lambda: self.model if hasattr(self.model, 'lm_head') and self.model.lm_head is not None else None),
+            ("self.model.model.lm_head", lambda: self.model.model if hasattr(self.model, 'model') and hasattr(self.model.model, 'lm_head') and self.model.model.lm_head is not None else None),
+            ("self.model.model.model.lm_head", lambda: self.model.model.model if hasattr(self.model.model, 'model') and hasattr(self.model.model.model, 'lm_head') and self.model.model.model.lm_head is not None else None),
+            ("self.model.language_model.lm_head", lambda: self.model.language_model if hasattr(self.model, 'language_model') and hasattr(self.model.language_model, 'lm_head') and self.model.language_model.lm_head is not None else None),
+            # CRITICAL: Gemma-3 multimodal models (gemma-3-4b-it) structure
+            ("self.model.model.language_model.lm_head", lambda: self.model.model.language_model if hasattr(self.model, 'model') and hasattr(self.model.model, 'language_model') and hasattr(self.model.model.language_model, 'lm_head') and self.model.model.language_model.lm_head is not None else None),
+        ]
+
+        for location_name, check_func in locations_to_check:
+            try:
+                lm_obj = check_func()
+                if lm_obj is not None:
+                    lm_head_state = lm_obj.state_dict()
+                    if lm_head_state is not None:
+                        weight_shape = lm_head_state.get('weight', torch.tensor([])).shape
+                        print(f"  ✓ Saved lm_head from {location_name} (shape: {weight_shape})")
+                        lm_head_found = True
+                        break
+            except Exception as e:
+                print(f"  Note: Could not access {location_name}: {e}")
+
+        if not lm_head_found:
+            print(f"  ⚠️  WARNING: Could not find lm_head in model - training will use random initialization!")
+            print(f"  This will cause poor speculative decoding performance.")
+            print(f"  Model type: {type(self.model).__name__}")
+            print(f"  Model attributes with 'lm': {[attr for attr in dir(self.model) if 'lm' in attr.lower()]}")
 
         save_dict = {
             "texts": texts,

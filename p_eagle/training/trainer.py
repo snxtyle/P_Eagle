@@ -749,6 +749,7 @@ class EagleTrainer:
     def __init__(
         self,
         drafter_model_name: str,
+        target_model_name: str,
         target_hidden_dim: int,
         feature_dir: str,
         output_dir: str,
@@ -785,6 +786,7 @@ class EagleTrainer:
     ):
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
+        self.target_model_name = target_model_name  # Store target model name for lm_head loading
         self.feature_dir = feature_dir
         self.num_epochs = num_epochs
         self.batch_size = batch_size
@@ -933,7 +935,7 @@ class EagleTrainer:
         # This is critical: drafter's hidden states are converted to tokens via target's lm_head
         print(f"Loading target lm_head for token-level training...")
         print(f"NOTE: Target model must have hidden_dim={target_hidden_dim} for lm_head compatibility")
-        self.target_lm_head = self._load_target_lm_head(target_hidden_dim)
+        self.target_lm_head = self._load_target_lm_head(target_hidden_dim, self.target_model_name)
 
         # Setup optimizer with SEPARATE learning rates for different components
         # CRITICAL FIX: MTP heads need higher LR to learn effectively
@@ -1112,79 +1114,158 @@ class EagleTrainer:
         print(f"  Batch size: {batch_size}")
         print(f"  Steps per epoch: {len(self.train_loader)}")
 
-    def _load_target_lm_head(self, target_hidden_dim: int):
-        """Load target model's lm_head for perfect KL alignment.
+    def _load_target_lm_head(self, target_hidden_dim: int, target_model_name: str = None):
+        """Load target model's lm_head for perfect alignment.
 
-        Attempts to load the actual lm_head weights saved during feature extraction.
-        This ensures the KL loss is computed with the exact same projection layer
-        that the target model uses, aligning training perfectly with inference.
+        CRITICAL FIX: This function now loads lm_head directly from the TARGET model,
+        not from the drafter. This ensures the drafter predicts tokens using the EXACT
+        same lm_head projection as the target model, which is essential for speculative
+        decoding to work.
+
+        The original implementation had two critical bugs:
+        1. Used drafter's tokenizer vocab_size (128K) instead of target's (262K)
+        2. Fell back to random initialization when lm_head wasn't in feature files
+
+        FIXED: Now handles Gemma-3 multimodal models which use model.model.language_model.lm_head
+
+        Args:
+            target_hidden_dim: Hidden dimension of target model
+            target_model_name: Name of target model (for direct loading)
         """
         import torch.nn as nn
-        from pathlib import Path
+        from transformers import AutoModelForCausalLM, AutoTokenizer
 
-        # Get vocab size from drafter (they should match for compatible models)
+        # Default to drafter's vocab size
         vocab_size = len(self.tokenizer)
+        actual_vocab_size = None
 
-        # Create lm_head with correct dimensions (bfloat16 to match drafter output)
-        lm_head = nn.Linear(target_hidden_dim, vocab_size, bias=False, dtype=torch.bfloat16).to(self.device)
-
-        # Attempt to load actual lm_head weights from feature files
-        loaded_weights = False
+        # First, try to get the correct vocab size from feature files
         try:
             feature_files = list(Path(self.feature_dir).glob("*_shard*.pt"))
             if feature_files:
-                # Load from the first shard to get lm_head weights
-                data = torch.load(feature_files[0], map_location=self.device, weights_only=False)
+                data = torch.load(feature_files[0], map_location='cpu', weights_only=False)
+                if "vocab_size" in data:
+                    feature_vocab = data["vocab_size"]
+                    if feature_vocab != vocab_size:
+                        print(f"  CRITICAL FIX: Feature file vocab_size ({feature_vocab}) != drafter tokenizer ({vocab_size})")
+                        vocab_size = feature_vocab
+                # Also check if lm_head was saved in feature file
+                if "lm_head" in data and data["lm_head"] is not None:
+                    print(f"  Found lm_head in feature file (will try to use)")
+        except Exception as e:
+            print(f"  Note: Could not read vocab_size from features: {e}")
+
+        # Try to load lm_head from the TARGET model directly (THE FIX)
+        target_lm = None
+        if target_model_name:
+            try:
+                print(f"  Loading target model lm_head directly from: {target_model_name}")
+                HF_TOKEN = os.getenv("HUGGINGFACE_TOKEN")
+
+                # Load target model
+                target_model = AutoModelForCausalLM.from_pretrained(
+                    target_model_name,
+                    torch_dtype=torch.bfloat16,
+                    low_cpu_mem_usage=True,
+                    token=HF_TOKEN
+                )
+
+                # Try multiple locations where lm_head might be stored
+                # Gemma-3 multimodal models use model.model.language_model.lm_head
+                lm_head_locations = [
+                    ("target_model.lm_head", lambda m: m if hasattr(m, 'lm_head') and m.lm_head is not None else None),
+                    ("target_model.model.lm_head", lambda m: m.model if hasattr(m, 'model') and hasattr(m.model, 'lm_head') and m.model.lm_head is not None else None),
+                    ("target_model.model.model.lm_head", lambda m: m.model.model if hasattr(m.model, 'model') and hasattr(m.model.model, 'lm_head') and m.model.model.lm_head is not None else None),
+                    ("target_model.language_model.lm_head", lambda m: m.language_model if hasattr(m, 'language_model') and hasattr(m.language_model, 'lm_head') and m.language_model.lm_head is not None else None),
+                    # CRITICAL: Gemma-3 multimodal structure (gemma-3-4b-it)
+                    ("target_model.model.language_model.lm_head", lambda m: m.model.language_model if hasattr(m, 'model') and hasattr(m.model, 'language_model') and hasattr(m.model.language_model, 'lm_head') and m.model.language_model.lm_head is not None else None),
+                ]
+
+                for location_name, check_func in lm_head_locations:
+                    try:
+                        lm_obj = check_func(target_model)
+                        if lm_obj is not None:
+                            target_lm = lm_obj
+                            print(f"  ✓ Found lm_head at {location_name}")
+                            break
+                    except Exception as e:
+                        pass  # Try next location
+
+                if target_lm is None:
+                    print(f"  Warning: Could not find lm_head in target model at any known location!")
+                    print(f"  Model type: {type(target_model).__name__}")
+                    # List attributes for debugging
+                    attrs = [a for a in dir(target_model) if 'lm' in a.lower() or 'head' in a.lower()]
+                    print(f"  Model attributes containing 'lm' or 'head': {attrs}")
+
+                if target_lm is not None:
+                    target_weight = target_lm.weight.detach()
+                    actual_vocab_size = target_weight.shape[0]
+
+                    print(f"  Target model lm_head shape: {target_weight.shape}")
+
+                    # If target vocab_size is different, we need to handle it
+                    if actual_vocab_size != vocab_size:
+                        print(f"  CRITICAL: Target vocab_size ({actual_vocab_size}) != current ({vocab_size})")
+                        print(f"  Will create lm_head with target's vocab_size")
+
+                    # Create lm_head with target's vocab size
+                    lm_head = nn.Linear(target_hidden_dim, actual_vocab_size, bias=False, dtype=torch.bfloat16).to(self.device)
+
+                    # Copy weights
+                    with torch.no_grad():
+                        # Check if hidden dimensions match
+                        if target_weight.shape[1] == target_hidden_dim:
+                            lm_head.weight.copy_(target_weight)
+                            print(f"  ✓ Copied lm_head from target model: {target_weight.shape}")
+                        else:
+                            # Need to project hidden dimension
+                            print(f"  Warning: Hidden dim mismatch ({target_weight.shape[1]} vs {target_hidden_dim}), copying overlapping weights")
+                            min_hidden = min(target_weight.shape[1], target_hidden_dim)
+                            lm_head.weight[:, :min_hidden] = target_weight[:, :min_hidden]
+
+                    # Clean up
+                    del target_model
+                    torch.cuda.empty_cache()
+
+                    print(f"  lm_head: {target_hidden_dim} -> {actual_vocab_size}")
+                    return lm_head
+
+            except Exception as e:
+                print(f"  Warning: Could not load from target model: {e}")
+                import traceback
+                traceback.print_exc()
+
+        # Fall back to creating lm_head with whatever vocab_size we have
+        print(f"  Creating lm_head with fallback: {target_hidden_dim} -> {vocab_size}")
+        lm_head = nn.Linear(target_hidden_dim, vocab_size, bias=False, dtype=torch.bfloat16).to(self.device)
+
+        # Try to load from feature files as secondary option
+        try:
+            feature_files = list(Path(self.feature_dir).glob("*_shard*.pt"))
+            if feature_files:
+                data = torch.load(feature_files[0], map_location='cpu', weights_only=False)
 
                 if "lm_head" in data and data["lm_head"] is not None:
                     saved_lm_head = data["lm_head"]
                     saved_weight = saved_lm_head.get("weight") if isinstance(saved_lm_head, dict) else None
 
                     if saved_weight is not None:
-                        saved_vocab_size = saved_weight.shape[0]
-                        saved_hidden_size = saved_weight.shape[1]
-
-                        print(f"  Saved lm_head: {saved_hidden_size} -> {saved_vocab_size}")
-                        print(f"  Target lm_head: {target_hidden_dim} -> {vocab_size}")
-
-                        # Handle size mismatch by copying overlapping weights
-                        if saved_vocab_size != vocab_size or saved_hidden_size != target_hidden_dim:
-                            print(f"  Resizing: copying overlapping weights...")
-                            with torch.no_grad():
-                                min_vocab = min(saved_vocab_size, vocab_size)
-                                min_hidden = min(saved_hidden_size, target_hidden_dim)
-                                lm_head.weight[:min_vocab, :min_hidden] = saved_weight[:min_vocab, :min_hidden]
-                            print(f"  Copied {min_vocab} vocab x {min_hidden} hidden dims")
-                            loaded_weights = True
-                        else:
-                            lm_head.load_state_dict(saved_lm_head)
-                            loaded_weights = True
-                            print(f"  Loaded target lm_head weights from feature file")
-                    else:
-                        print(f"  Warning: Could not parse lm_head weight tensor")
-                else:
-                    print(f"  Warning: No lm_head weights found in feature files")
-
-                # Verify dimensions
-                saved_vocab_size = data.get("vocab_size", vocab_size)
-                saved_hidden_size = data.get("hidden_size", target_hidden_dim)
-
-                if saved_vocab_size != vocab_size:
-                    print(f"  Note: Vocab size adjusted - features: {saved_vocab_size}, using: {vocab_size}")
-                if saved_hidden_size != target_hidden_dim:
-                    print(f"  Error: Hidden dim mismatch - features: {saved_hidden_size}, expected: {target_hidden_dim}")
-            else:
-                print(f"  Warning: No feature files found in {self.feature_dir}")
+                        print(f"  Loaded lm_head from feature file: {saved_weight.shape}")
+                        with torch.no_grad():
+                            min_vocab = min(saved_weight.shape[0], vocab_size)
+                            min_hidden = min(saved_weight.shape[1], target_hidden_dim)
+                            lm_head.weight[:min_vocab, :min_hidden] = saved_weight[:min_vocab, :min_hidden]
+                        print(f"  Copied {min_vocab} x {min_hidden} weights from feature file")
+                        return lm_head
         except Exception as e:
-            print(f"  Warning: Failed to load lm_head weights: {e}")
+            print(f"  Warning: Could not load from feature files: {e}")
 
-        if not loaded_weights:
-            # Fall back to random initialization with warning
-            nn.init.normal_(lm_head.weight, std=0.02)
-            print(f"  Using randomly initialized lm_head (KL loss may not align perfectly)")
-
-        print(f"  lm_head: {target_hidden_dim} -> {vocab_size}")
-        print(f"  During inference, actual target lm_head will be used")
+        # Final fallback: random initialization (THIS SHOULD NOT HAPPEN with proper setup)
+        print(f"  ***WARNING: Using randomly initialized lm_head!***")
+        print(f"  This will NOT work for speculative decoding!")
+        print(f"  CRITICAL: You must re-extract features with the fixed feature_extractor.py")
+        nn.init.normal_(lm_head.weight, std=0.02)
 
         return lm_head
 
@@ -2129,7 +2210,13 @@ class EagleTrainer:
 
         if mse_losses:
             mse_total = sum(mse_losses) / len(mse_losses)
-            total_loss = total_loss + mse_total
+            # CRITICAL FIX: MSE and CE have vastly different scales
+            # CE loss is typically 2-10 (log scale), MSE is typically 0.01-1.0
+            # Without scaling, MSE contributes ~0% to the gradient
+            # Scale MSE to match CE scale (empirical: multiply by ~10-20)
+            # This ensures both loss components properly influence training
+            MSE_TO_CE_SCALE = 15.0  # Based on empirical observation
+            total_loss = total_loss + mse_total * MSE_TO_CE_SCALE
 
         # --- LOSS SCALING ---
         # CE loss is already properly scaled in hidden_state_token_loss.
@@ -2263,6 +2350,8 @@ class EagleTrainer:
 def main():
     parser = argparse.ArgumentParser(description="P-EAGLE Drafter Training")
     parser.add_argument("--drafter_model", required=True, help="Base model for drafter")
+    parser.add_argument("--target_model", default="google/gemma-3-4b-it",
+                        help="Target model name for lm_head loading (default: google/gemma-3-4b-it)")
     parser.add_argument("--target_hidden_dim", type=int, required=True)
     parser.add_argument("--speculation_depth", type=int, default=4)
     parser.add_argument("--feature_dir", required=True)
@@ -2374,6 +2463,7 @@ def main():
 
     trainer = EagleTrainer(
         drafter_model_name=args.drafter_model,
+        target_model_name=args.target_model,
         target_hidden_dim=args.target_hidden_dim,
         feature_dir=args.feature_dir,
         output_dir=args.output_dir,

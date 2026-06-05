@@ -303,35 +303,39 @@ class EagleMTPHead(nn.Module):
     """
     Multi-Token Prediction Head for P-EAGLE.
     Predicts the hidden state at position t+k given the hidden state at position t.
+
+    Architecture matches the training MTPHead in train_packed.py:
+    - Pre-norm: LayerNorm
+    - MLP: Linear -> GELU -> Linear
+    - Rescale: Learnable parameter
     """
 
     def __init__(
         self,
         hidden_dim: int,
         target_hidden_dim: int,
-        num_layers: int = 2,
-        dropout: float = 0.1,
+        intermediate_dim: int = None,
+        dropout: float = 0.0,  # Not used in training MTPHead
         dtype: torch.dtype = torch.float32
     ):
         super().__init__()
 
         self.hidden_dim = hidden_dim
         self.target_hidden_dim = target_hidden_dim
+        intermediate_dim = intermediate_dim or hidden_dim
 
-        layers = []
-        in_dim = hidden_dim
+        # Pre-norm (matches training structure)
+        self.norm = nn.LayerNorm(hidden_dim, dtype=dtype)
 
-        for i in range(num_layers - 1):
-            layers.extend([
-                nn.Linear(in_dim, hidden_dim, dtype=dtype),
-                nn.LayerNorm(hidden_dim, dtype=dtype),
-                nn.GELU(),
-                nn.Dropout(dropout)
-            ])
-            in_dim = hidden_dim
+        # MLP: Linear -> GELU -> Linear
+        self.mlp = nn.Sequential(
+            nn.Linear(hidden_dim, intermediate_dim, dtype=dtype),  # mlp.0
+            nn.GELU(),                                               # mlp.1
+            nn.Linear(intermediate_dim, target_hidden_dim, dtype=dtype),  # mlp.2
+        )
 
-        layers.append(nn.Linear(hidden_dim, target_hidden_dim, dtype=dtype))
-        self.mlp = nn.Sequential(*layers)
+        # Rescale parameter (matches training structure)
+        self.rescale = nn.Parameter(torch.ones(target_hidden_dim, dtype=dtype))
 
         self._init_weights()
 
@@ -341,9 +345,16 @@ class EagleMTPHead(nn.Module):
                 nn.init.normal_(module.weight, std=0.02)
                 if module.bias is not None:
                     nn.init.zeros_(module.bias)
+        # Initialize rescale to 10.0 to counteract the 0.1 factor
+        # This gives effective initial scaling of 1.0 (neutral)
+        # The model can then learn the optimal scaling during training
+        nn.init.constant_(self.rescale, 10.0)
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        return self.mlp(hidden_states)
+        # Pre-norm + MLP + rescale (matches training MTPHead)
+        x_norm = self.norm(hidden_states)
+        out = self.mlp(x_norm)
+        return out * self.rescale * 0.1
 
 
 class EagleDrafterModel(nn.Module):
@@ -373,6 +384,7 @@ class EagleDrafterModel(nn.Module):
         quantization: str = None,
         use_flash_attention: bool = True,
         mtp_dropout: float = 0.1,  # Dropout in MTP heads for regularization
+        base_model=None,  # Optional: pass pre-loaded model to reuse (for self-speculative)
     ):
         super().__init__()
 
@@ -395,48 +407,69 @@ class EagleDrafterModel(nn.Module):
         cache_dir = os.environ.get("HF_HOME") or os.path.join(os.getcwd(), "models_cache")
         os.makedirs(cache_dir, exist_ok=True)
 
-        print(f"Loading base drafter model: {base_model_name}")
-        print(f"Cache directory: {cache_dir}")
-        if quantization:
-            print(f"Quantization: {quantization}")
-
-        self.config = AutoConfig.from_pretrained(base_model_name, cache_dir=cache_dir)
-
-        # Handle Gemma3-style nested config (multimodal models have text_config)
-        if hasattr(self.config, 'text_config') and self.config.text_config is not None:
-            self.text_config = self.config.text_config
+        # Handle pre-loaded base model (for self-speculative decoding)
+        if base_model is not None:
+            print(f"Using pre-loaded base model (self-speculative)")
+            self.base_model = base_model
+            # Detect device from base_model
+            bp = next(base_model.parameters(), None)
+            if bp is not None:
+                self.device = str(bp.device)
+                device = self.device
+            # Get config from pre-loaded model
+            if hasattr(base_model, 'config'):
+                self.config = base_model.config
+            elif hasattr(base_model, 'model') and hasattr(base_model.model, 'config'):
+                self.config = base_model.model.config
+            else:
+                self.config = None
+            if self.config and hasattr(self.config, 'text_config') and self.config.text_config:
+                self.text_config = self.config.text_config
+            else:
+                self.text_config = self.config
         else:
-            self.text_config = self.config
+            print(f"Loading base drafter model: {base_model_name}")
+            print(f"Cache directory: {cache_dir}")
+            if quantization:
+                print(f"Quantization: {quantization}")
 
-        # Setup quantization config if requested
-        model_kwargs = {
-            "torch_dtype": torch.bfloat16,
-            "device_map": {"": device} if torch.cuda.is_available() else "cpu",
-            "cache_dir": cache_dir
-        }
+            self.config = AutoConfig.from_pretrained(base_model_name, cache_dir=cache_dir)
 
-        if quantization == "8bit":
-            from transformers import BitsAndBytesConfig
-            model_kwargs["quantization_config"] = BitsAndBytesConfig(
-                load_in_8bit=True,
-                bnb_8bit_compute_dtype=torch.bfloat16
+            # Handle Gemma3-style nested config (multimodal models have text_config)
+            if hasattr(self.config, 'text_config') and self.config.text_config is not None:
+                self.text_config = self.config.text_config
+            else:
+                self.text_config = self.config
+
+            # Setup quantization config if requested
+            model_kwargs = {
+                "torch_dtype": torch.bfloat16,
+                "device_map": {"": device} if torch.cuda.is_available() else "cpu",
+                "cache_dir": cache_dir
+            }
+
+            if quantization == "8bit":
+                from transformers import BitsAndBytesConfig
+                model_kwargs["quantization_config"] = BitsAndBytesConfig(
+                    load_in_8bit=True,
+                    bnb_8bit_compute_dtype=torch.bfloat16
+                )
+                model_kwargs["torch_dtype"] = torch.float16  # 8-bit requires float16
+            elif quantization == "4bit":
+                from transformers import BitsAndBytesConfig
+                model_kwargs["quantization_config"] = BitsAndBytesConfig(
+                    load_in_4bit=True,
+                    bnb_4bit_compute_dtype=torch.bfloat16,
+                    bnb_4bit_use_double_quant=True,
+                    bnb_4bit_quant_type="nf4"
+                )
+
+            self.base_model = AutoModelForCausalLM.from_pretrained(
+                base_model_name,
+                **model_kwargs
             )
-            model_kwargs["torch_dtype"] = torch.float16  # 8-bit requires float16
-        elif quantization == "4bit":
-            from transformers import BitsAndBytesConfig
-            model_kwargs["quantization_config"] = BitsAndBytesConfig(
-                load_in_4bit=True,
-                bnb_4bit_compute_dtype=torch.bfloat16,
-                bnb_4bit_use_double_quant=True,
-                bnb_4bit_quant_type="nf4"
-            )
 
-        self.base_model = AutoModelForCausalLM.from_pretrained(
-            base_model_name,
-            **model_kwargs
-        )
-
-        self.hidden_dim = self.text_config.hidden_size
+        self.hidden_dim = self.text_config.hidden_size if self.text_config else self.base_model.config.hidden_size
         print(f"Base model hidden dim: {self.hidden_dim}")
         print(f"Target model hidden dim: {target_hidden_dim}")
 
@@ -485,8 +518,15 @@ class EagleDrafterModel(nn.Module):
             dtype=base_dtype
         ).to(device)
 
+        # For self-speculative decoding (target_hidden_dim == self.hidden_dim),
+        # initialize as identity to preserve the hidden states
+        if target_hidden_dim == self.hidden_dim:
+            nn.init.eye_(self.target_hidden_proj.weight)
+            if self.target_hidden_proj.bias is not None:
+                nn.init.zeros_(self.target_hidden_proj.bias)
+
         self.mtp_heads = nn.ModuleList([
-            EagleMTPHead(target_hidden_dim, target_hidden_dim, num_layers=2, dropout=mtp_dropout, dtype=base_dtype).to(device)
+            EagleMTPHead(target_hidden_dim, target_hidden_dim, dropout=mtp_dropout, dtype=base_dtype).to(device)
             for _ in range(speculation_depth)
         ])
         print(f"MTP dropout: {mtp_dropout}")
@@ -1125,17 +1165,21 @@ class EagleDrafterModel(nn.Module):
             model.target_hidden_proj.load_state_dict(checkpoint["target_hidden_proj"])
 
         # Load target lm_head if present (for vocab compatibility)
+        # CRITICAL FIX: Detect bias setting from checkpoint to match whichever training script was used
         if "target_lm_head" in checkpoint:
             import torch.nn as nn
             lm_head_state = checkpoint["target_lm_head"]
             vocab_size = lm_head_state["weight"].shape[0]
             hidden_size = lm_head_state["weight"].shape[1]
+            # Check if checkpoint has bias - use same bias setting as training
+            # train_packed.py uses bias=False, train_eagle3.py uses bias=True
+            has_bias = 'bias' in lm_head_state and lm_head_state['bias'] is not None
 
             model.target_lm_head = nn.Linear(
-                hidden_size, vocab_size, bias=False, dtype=torch.bfloat16, device=device
+                hidden_size, vocab_size, bias=has_bias, dtype=torch.bfloat16, device=device
             )
-            model.target_lm_head.load_state_dict(lm_head_state)
+            model.target_lm_head.load_state_dict(lm_head_state, strict=False)
             model.target_lm_head.eval()
-            print(f"Loaded target lm_head from checkpoint: {hidden_size} -> {vocab_size}")
+            print(f"Loaded target lm_head from checkpoint: {hidden_size} -> {vocab_size} (bias={has_bias})")
 
         return model

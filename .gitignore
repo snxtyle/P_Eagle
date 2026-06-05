@@ -28,7 +28,8 @@ outputs/*
 docs/*
 logs/*
 *.log
-
+model_cache
+eval_results/*
 # But track the directory structure with .gitkeep
 !data/.gitkeep
 !checkpoints/.gitkeep

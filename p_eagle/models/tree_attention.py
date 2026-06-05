@@ -268,10 +268,12 @@ def create_speculative_tree(
     # Convert hidden states to tokens
     draft_tokens = []
     for k in range(min(speculation_depth, len(mtp_predictions))):
-        # Use drafter's lm_head or target's lm_head
+        # Use drafter's target_lm_head to convert hidden -> logits
         pred_hidden = mtp_predictions[k]
-        # Assuming lm_head is available
-        logits = pred_hidden  # Placeholder - need actual lm_head
+        # CRITICAL FIX: Apply lm_head to convert hidden states to vocabulary logits
+        # pred_hidden shape: [..., target_hidden_dim]
+        # lm_head: [target_hidden_dim, vocab_size]
+        logits = drafter.target_lm_head(pred_hidden)
         token = torch.argmax(logits, dim=-1)
         draft_tokens.append(token)
 
